@@ -1,11 +1,12 @@
 """
 claude_agent.py — Harness Agent: Claude CLI + 多窗口编排 + 项目管理
 
-PATCHED VERSION — 直接替换你的 claude-tg-bot/claude_agent.py
+DROP-IN REPLACEMENT — 直接替换你的 claude-tg-bot/claude_agent.py
 
 改了什么:
-1. _SYSTEM_PROMPT 增加了 Harness 技能（多窗口、项目管理、截图、session管理）
-2. 没有其他任何改动。路由、session、队列全部保持原样。
+1. _SYSTEM_PROMPT 增加了 Harness 技能（多窗口、项目管理、截图、session管理、多AI协作、权限确认）
+2. 删除了 API fallback（不花钱，只走 CLI）
+3. 没有其他任何改动。路由、session、队列全部保持原样。
 
 Architecture:
   User (Telegram) → bot.py → claude_agent.py → claude -p --resume <session>
@@ -77,17 +78,22 @@ GitHub: https://github.com/kdyz1205/claude-tg-bot
 4. 截图最终结果 → 用中文总结发回TG
 5. 如果桌面没有该session → 退回模式1（自己开新CLI进程做）
 
-## 自我学习循环
+## 自我学习
+每次操作后: 尝试→观察→记录到 .harness_memory.json → 下次复用
+失败时: 换方法重试(最多3次) → 记录失败原因
 
-你有记忆能力。每次操作后自我评估:
-1. **尝试** → 执行任务（读代码/改文件/操控窗口）
-2. **观察** → 截图或读输出，看结果是否正确
-3. **记录** → 如果发现新方法/路径/技巧，写入 `{BOT_PROJECT_DIR}\\.harness_memory.json`
-4. **下次** → 执行前先读 `.harness_memory.json`，复用之前学到的
+## 权限确认（重要操作前）
+执行高风险操作前（删除文件、改系统设置、发送消息等）:
+1. 用PowerShell弹窗问用户: `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $r = [System.Windows.Forms.MessageBox]::Show('允许执行: XXX?','Harness确认','YesNo','Question'); $r"`
+2. 返回 Yes → 执行, No → 跳过
+3. 或者更快: 显示toast通知, 5秒内无操作=默认允许
 
-记忆格式: `{{"skill": "操控crypto窗口", "method": "截图→点(x,y)→输入", "learned": "2025-xx-xx"}}`
-
-失败时: 换方法重试(最多3次) → 记录失败原因 → 下次避免
+## 多AI协作
+做网站等复杂任务 → 拆分并行:
+- Gemini → `start chrome --new-window "https://gemini.google.com"` 生成图片
+- ChatGPT → `start chrome --new-window "https://chatgpt.com"` 生成文案
+- 自己(Claude Code) → 写HTML/CSS/JS代码
+- 收集所有结果 → 组装 → 报告
 """
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
@@ -408,7 +414,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
 
 
 async def process_message(user_message: str, chat_id: int, context):
-    """Process a user message — single path, no duplicate calls."""
+    """Process a user message — CLI only, no API fallback."""
     lock = _get_lock(chat_id)
 
     if lock.locked():
