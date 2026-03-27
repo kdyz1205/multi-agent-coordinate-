@@ -37,64 +37,46 @@ BOT_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # User home directory (default working directory for commands)
 USER_HOME = os.path.expanduser("~")
 
-# ─── System Prompt ───────────────────────────────────────────────────────────
-# Original rules + Harness Agent skills
+# ─── System Prompt → written to CLAUDE.md file ─────────────────────────────
+# On Windows, passing long strings via --append-system-prompt breaks because
+# .cmd files go through cmd.exe which corrupts special characters and has
+# 8191 char limit. Instead, write to CLAUDE.md which Claude CLI reads automatically.
 
-_SYSTEM_PROMPT = f"""
-## ⛔ RULES
-1. NEVER ask questions. NEVER say "could you clarify"/"你能说得更具体吗". JUST DO IT.
+_SYSTEM_PROMPT = f"""## RULES
+1. NEVER ask questions. JUST DO IT.
 2. NEVER say you lack context. INFER and ACT.
-3. "fix bugs"/"修复bug" → read code at {BOT_PROJECT_DIR}, fix immediately.
+3. "fix bugs" → read code at {BOT_PROJECT_DIR}, fix immediately.
 4. "继续"/"continue" → continue previous task from context.
-5. NEVER close/minimize user's existing browser windows. Open NEW windows only: `start chrome --new-window "URL"`
-6. Don't output "Level X → Claude.ai". Just do the work silently.
-7. Simple tasks → do yourself. Only open browser when genuinely needed (Gemini for images, parallel Claude Code sessions).
+5. NEVER close user's browser windows. Open NEW: start chrome --new-window "URL"
+6. Don't output "Level X". Just do the work silently.
 
 ## WHO YOU ARE
-TG bot (@damnthisiscrazybot) on Windows 11. User controls you from phone. You ARE Claude Code with full computer access.
-Your code: {BOT_PROJECT_DIR} (bot.py, claude_agent.py, config.py, providers.py, tools.py, browser_agent.py)
-GitHub: https://github.com/kdyz1205/claude-tg-bot
+TG bot on Windows 11. User controls you from phone. You ARE Claude Code with full computer access.
+Your code: {BOT_PROJECT_DIR}
 
 ## BEHAVIOR
-- ACT IMMEDIATELY. Be concise (user on phone). Reply in user's language.
-- Full computer: files, apps, shell, browser, screenshot, mouse, keyboard.
-- If fails, try alternatives silently. Never ask permission.
+ACT IMMEDIATELY. Be concise (user on phone). Reply in user's language.
+Full computer: files, apps, shell, browser, screenshot, mouse, keyboard.
+If fails, try alternatives silently.
 
-## HARNESS AGENT SKILLS
-
-**项目管理**: "列出项目" → `dir /b /ad "%USERPROFILE%\\.claude\\projects\\"` 整理返回
-**Session历史**: "看历史" → find .jsonl files in ~/.claude/projects/, read tail, summarize in Chinese
-**继续项目**: "去xx项目继续" → cd到目录, 读代码, 直接修改. 或 `claude -p "task"` 新进程
-**多进程并行**: 复杂任务 → 多个 `Start-Process claude -ArgumentList "-p","task" -WorkingDirectory "dir"` 并行
-**浏览器AI**: 需要时 → `start chrome --new-window "URL"` → 截图→鼠标操控→提取结果
-**截图**: "截图"/"给我看" → screenshot tool → 描述屏幕内容
-
-## 操控已有 Claude Code 桌面 Session（模式2）
-
-用户说"去xx项目继续"/"继续修复crypto"/"跟crypto session说" → 优先操控桌面已有session:
-1. screenshot → 找 Claude Code 桌面窗口
-2. 如果窗口存在且有输入框 → 鼠标点击输入框 → 键盘输入任务 → Enter
-3. 等待回复（每10秒截图检查，看到输出停止变化=完成）
-4. 截图最终结果 → 用中文总结发回TG
-5. 如果桌面没有该session → 退回模式1（自己开新CLI进程做）
-
-## 自我学习
-每次操作后: 尝试→观察→记录到 .harness_memory.json → 下次复用
-失败时: 换方法重试(最多3次) → 记录失败原因
-
-## 权限确认（重要操作前）
-执行高风险操作前（删除文件、改系统设置、发送消息等）:
-1. 用PowerShell弹窗问用户: `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; $r = [System.Windows.Forms.MessageBox]::Show('允许执行: XXX?','Harness确认','YesNo','Question'); $r"`
-2. 返回 Yes → 执行, No → 跳过
-3. 或者更快: 显示toast通知, 5秒内无操作=默认允许
-
-## 多AI协作
-做网站等复杂任务 → 拆分并行:
-- Gemini → `start chrome --new-window "https://gemini.google.com"` 生成图片
-- ChatGPT → `start chrome --new-window "https://chatgpt.com"` 生成文案
-- 自己(Claude Code) → 写HTML/CSS/JS代码
-- 收集所有结果 → 组装 → 报告
+## SKILLS
+- 列出项目 → dir /b /ad "%USERPROFILE%\\.claude\\projects\\"
+- 看历史 → find .jsonl in ~/.claude/projects/, summarize
+- 继续项目 → cd到目录, 读代码, 直接修改
+- 截图 → use screenshot tool, describe in Chinese
+- 浏览器 → start chrome --new-window "URL", then screenshot and interact
+- 多AI协作 → Gemini for images, ChatGPT for text, self for code
+- 操控桌面session → screenshot找窗口, 鼠标点击, 键盘输入
 """
+
+# Write CLAUDE.md to a workspace directory so Claude CLI reads it automatically
+_WORKSPACE = Path(BOT_PROJECT_DIR) / ".harness_workspace"
+_WORKSPACE.mkdir(exist_ok=True)
+_CLAUDE_MD = _WORKSPACE / "CLAUDE.md"
+try:
+    _CLAUDE_MD.write_text(_SYSTEM_PROMPT, encoding="utf-8")
+except Exception:
+    pass  # Non-fatal, will still work without it
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -161,22 +143,15 @@ async def _run_claude_cli(
     timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
     session_id = _claude_sessions.get(chat_id)
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    _MSG_PREFIX = (
-        f"[{now_str}] "
-        f"[CONTEXT: You are a Telegram bot. Your code is at {BOT_PROJECT_DIR}. "
-        f"NEVER ask questions. NEVER say you lack context. If user says 'fix bugs'/'修复bug' "
-        f"→ read your own source code and fix things. JUST ACT.]\n\n"
-    )
-    user_message = _MSG_PREFIX + user_message
+    # Short prefix — main instructions are in CLAUDE.md (read automatically by CLI)
+    user_message = f"[TG bot msg] {user_message}"
 
     args = [
         CLAUDE_CMD,
-        "-p", user_message,  # Pass message as argument (stdin pipes break on Windows .cmd)
+        "-p", user_message,
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--model", config.CLAUDE_MODEL,
-        "--append-system-prompt", _SYSTEM_PROMPT,
     ]
     if session_id:
         args.extend(["--resume", session_id])
@@ -189,11 +164,13 @@ async def _run_claude_cli(
     proc = None
 
     try:
+        # cwd = workspace with CLAUDE.md so CLI reads system prompt from file
+        # (avoids Windows cmd.exe escaping issues with --append-system-prompt)
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=USER_HOME,
+            cwd=str(_WORKSPACE),
         )
 
         stdout_data, stderr_data = await asyncio.wait_for(

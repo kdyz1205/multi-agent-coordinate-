@@ -151,6 +151,14 @@ def deploy(bot_dir):
         except Exception as e:
             log(f"  WARNING: Could not disable providers.py: {e}")
 
+    # Verify CLAUDE.md workspace was created (system prompt lives here now)
+    workspace = bot_dir / ".harness_workspace"
+    claude_md = workspace / "CLAUDE.md"
+    if claude_md.exists():
+        log(f"  CLAUDE.md ready ({claude_md.stat().st_size} bytes)")
+    else:
+        log("  WARNING: CLAUDE.md not found — bot startup will create it")
+
     # Clear sessions
     s = bot_dir / ".sessions.json"
     if s.exists():
