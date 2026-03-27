@@ -1,8 +1,12 @@
 """
 Agent Layer — defines what an agent is and how it behaves.
 
-An Agent has a role, capabilities, and a processing function.
-It can receive handoffs, process them, and produce new handoffs.
+CrewAI-inspired: Each agent has Role + Goal + Backstory.
+LangGraph-inspired: Agents can delegate and share state.
+Anthropic-inspired: Keep it simple, compose with code.
+
+An Agent has a role, goal, backstory, capabilities, and a processing function.
+It can receive handoffs, process them, delegate to peers, and produce new handoffs.
 """
 
 from __future__ import annotations
@@ -17,15 +21,27 @@ from harness.protocol import AgentRole, Handoff, Message, MessageType
 
 @dataclass
 class AgentConfig:
-    """Configuration for an agent instance."""
+    """
+    Configuration for an agent instance.
+
+    CrewAI pattern: Role + Goal + Backstory
+    - role: What the agent IS (e.g., "Senior Python Developer")
+    - goal: What the agent WANTS (e.g., "Write clean, tested code")
+    - backstory: WHO the agent is (e.g., "10 years of Python experience...")
+
+    These three shape how the agent approaches every task.
+    """
     name: str
     role: AgentRole
+    goal: str = ""               # What this agent aims to achieve
+    backstory: str = ""          # Context/personality that shapes behavior
     description: str = ""
     capabilities: list[str] = field(default_factory=list)
     working_dir: str = "."
     max_iterations: int = 10
     convergence_threshold: float = 0.9
     auto_loop: bool = True
+    allow_delegation: bool = False  # Can delegate tasks to other agents
     channel_type: str = "file"  # "file", "git", "api"
     channel_config: dict[str, Any] = field(default_factory=dict)
 
@@ -109,18 +125,29 @@ class AgentConfig:
 
 class Agent:
     """
-    An agent that can process handoffs and participate in loops.
+    An agent that can process handoffs, delegate, and participate in loops.
+
+    CrewAI pattern: Role + Goal + Backstory shape behavior.
+    LangGraph pattern: Can delegate to peers via crew reference.
+    Anthropic pattern: Orchestrator-worker delegation.
 
     Usage:
         agent = Agent(config)
         agent.on_receive(my_handler)
         result = agent.process(handoff)
+
+        # With delegation:
+        agent = Agent(config, crew={"reviewer": reviewer_agent})
+        agent.delegate("reviewer", task)
     """
 
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig, crew: dict[str, Agent] | None = None):
         self.config = config
         self.name = config.name
         self.role = config.role
+        self.goal = config.goal
+        self.backstory = config.backstory
+        self.crew = crew or {}  # Other agents this agent can delegate to
         self._handler: Callable[[Handoff], Handoff] | None = None
         self._history: list[Handoff] = []
         self.is_running = False
@@ -173,6 +200,43 @@ class Agent:
             from harness.channels import get_channel
             channel = get_channel(self.config.channel_type, self.config.channel_config)
         return channel.receive(self.name)
+
+    def delegate(self, to_agent: str, handoff: Handoff) -> Handoff | None:
+        """
+        Delegate a handoff to another agent in the crew.
+        CrewAI pattern: agents can delegate to coworkers.
+        """
+        if not self.config.allow_delegation:
+            raise RuntimeError(f"Agent '{self.name}' is not allowed to delegate. Set allow_delegation=True")
+
+        if to_agent not in self.crew:
+            raise ValueError(f"Agent '{to_agent}' not in crew. Available: {list(self.crew.keys())}")
+
+        peer = self.crew[to_agent]
+        handoff.add_message(Message(
+            msg_type=MessageType.STATUS,
+            sender=self.name,
+            receiver=to_agent,
+            content=f"Delegating to {to_agent}: {handoff.instructions[:100]}",
+        ))
+
+        return peer.process(handoff)
+
+    def build_system_prompt(self) -> str:
+        """
+        Build a system prompt from role + goal + backstory.
+        Used when calling LLMs to give the agent its identity.
+        """
+        parts = []
+        if self.config.role != AgentRole.CUSTOM:
+            parts.append(f"You are a {self.config.role.value}.")
+        if self.goal:
+            parts.append(f"Your goal: {self.goal}")
+        if self.backstory:
+            parts.append(f"Background: {self.backstory}")
+        if self.config.capabilities:
+            parts.append(f"Your skills: {', '.join(self.config.capabilities)}")
+        return "\n".join(parts)
 
     @property
     def history(self) -> list[Handoff]:
