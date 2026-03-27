@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import subprocess
 import urllib.request
 import urllib.error
@@ -73,7 +74,8 @@ def deploy(bot_dir):
     target = bot_dir / "claude_agent.py"
     log("Downloading latest claude_agent.py from GitHub...")
     try:
-        urllib.request.urlretrieve(GITHUB_RAW, str(target))
+        url = GITHUB_RAW + f"?t={int(time.time())}"  # cache-bust GitHub CDN
+        urllib.request.urlretrieve(url, str(target))
     except Exception as e:
         log(f"  urllib failed: {e}, trying PowerShell...")
         try:
@@ -85,8 +87,21 @@ def deploy(bot_dir):
             log(f"  PowerShell also failed: {e2}")
             return False
 
-    # Verify file was actually replaced — check for API fallback
+    # Verify file was actually replaced
     content = target.read_text(encoding="utf-8")
+
+    # Check expected function signatures exist
+    if "async def process_message" not in content:
+        log("  ERROR: Downloaded file missing process_message function!")
+        return False
+    if "_process_with_claude_cli" not in content:
+        log("  ERROR: Downloaded file missing _process_with_claude_cli!")
+        return False
+    if len(content) < 5000:
+        log(f"  ERROR: Downloaded file too small ({len(content)} bytes)!")
+        return False
+
+    # Check for API fallback
     if "process_with_auto_fallback" in content:
         log("  ERROR: File STILL has API fallback! Stripping manually...")
         lines = content.split("\n")
@@ -113,6 +128,28 @@ def deploy(bot_dir):
         log(f"  SYNTAX ERROR: {r.stderr[:300]}")
         return False
     log("  Syntax OK, no API fallback, deployed.")
+
+    # Delete __pycache__ to force Python to recompile from new .py file
+    pycache = bot_dir / "__pycache__"
+    if pycache.exists():
+        shutil.rmtree(pycache, ignore_errors=True)
+        log("  Deleted __pycache__/ (force recompile)")
+    for pyc in bot_dir.glob("*.pyc"):
+        try:
+            pyc.unlink()
+            log(f"  Deleted stale {pyc.name}")
+        except Exception:
+            pass
+
+    # Disable providers.py so even stale bytecode can't call paid APIs
+    providers_file = bot_dir / "providers.py"
+    providers_bak = bot_dir / "providers.py.disabled"
+    if providers_file.exists():
+        try:
+            providers_file.rename(providers_bak)
+            log("  Disabled providers.py (renamed to .disabled)")
+        except Exception as e:
+            log(f"  WARNING: Could not disable providers.py: {e}")
 
     # Clear sessions
     s = bot_dir / ".sessions.json"
@@ -144,6 +181,11 @@ def kill_existing_bot(bot_dir=None):
                     log(f"  Removed PID file: {f.name}")
                 except Exception:
                     pass
+        # Also clear __pycache__ before restart
+        pycache = Path(str(bot_dir)) / "__pycache__"
+        if pycache.exists():
+            shutil.rmtree(pycache, ignore_errors=True)
+            log("  Cleared __pycache__/")
     log("  Done.")
 
 
