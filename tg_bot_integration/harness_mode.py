@@ -1,124 +1,218 @@
 """
-harness_mode.py — PRIMARY processing mode for the Telegram bot.
+harness_mode.py — The Harness Agent: an AI orchestrator with eyes and hands.
 
 DROP THIS FILE into your claude-tg-bot/ directory.
 
-Architecture (Harness-First):
-  User (Telegram) → bot.py → claude_agent.py → harness_mode.py
-                                                    ↓
-                                              1. "需要操控电脑?" 检测
-                                                    ↓
-                                    ┌─ YES → Claude CLI (唯一有工具的)
-                                    └─ NO  → Dispatcher (classify difficulty)
-                                                    ↓
-                                              ┌─ Level 1 (Q&A) → Grok / GPT
-                                              ├─ Level 2 (单文件) → Claude Web
-                                              ├─ Level 3 (重度代码) → Claude Code Web
-                                              └─ Level 4-5 (多文件) → 多平台并行 + Git合并
-                                                    ↓
-                                              Result → Telegram
+What is the Harness Agent?
+  Claude CLI = an AI with 39 tools (shell, screenshot, mouse, keyboard, browser, files)
+  Harness Agent = Claude CLI + a system prompt that teaches it to be a multi-window orchestrator
 
-Cost: $0.00 (uses your existing AI subscriptions via browser)
+Architecture:
+  User (Telegram) → TG Bot → harness_mode.py
+                                    ↓
+                              Claude CLI (with Harness System Prompt)
+                                    ↓
+                              Claude sees the screen, decides what to do:
+                                ├─ Simple? → answer directly
+                                ├─ Code? → open Claude Code, write code
+                                ├─ Complex? → open 2 Claude Code windows + assign tasks
+                                ├─ Images? → open Gemini, generate
+                                ├─ Multi-step? → coordinate across windows
+                                └─ Done? → collect results, report back via TG
 
-Routing priority:
-  ★ Harness Mode (browser) = PRIMARY (free, multi-platform)
-  Claude CLI              = ONLY when task needs computer control
-  API Mode (tokens)       = LAST resort (all platforms exhausted)
+The key insight: Claude CLI IS the harness. It has computer use tools.
+We just need to give it the right instructions.
+
+Cost: Uses your Plan subscription (Claude CLI tokens), NOT API tokens.
 """
 
 import asyncio
 import logging
+import os
+import subprocess
+import json
 import time
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# ─── Lazy imports ────────────────────────────────────────────────────────────
+# ─── Harness Agent System Prompt ─────────────────────────────────────────────
+# This is injected into Claude CLI to make it the multi-window orchestrator.
 
-_web_ai = None
+HARNESS_SYSTEM_PROMPT = r"""
+You are the HARNESS AGENT — a master orchestrator that controls this computer to coordinate multiple AI tools simultaneously.
+
+## Your Identity
+- You receive tasks from a Telegram bot user
+- You have full computer control: mouse, keyboard, screenshot, shell, files, browser
+- You can see the screen (screenshot) and act on what you see (click, type)
+- You are NOT just a chatbot — you are an AI with hands and eyes
+
+## Your Decision Process
+
+When you receive a task, analyze it and decide:
+
+### 1. Simple Q&A / Chat
+→ Answer directly. No need to open anything.
+
+### 2. Single Code Task (one file, moderate complexity)
+→ Write the code yourself directly. You ARE Claude Code.
+
+### 3. Heavy Code Task (complex, multi-function)
+→ Option A: Write it yourself if you can handle it
+→ Option B: Open a Claude Code web session (claude.ai/code) and delegate
+
+### 4. Multi-File / Full-Stack Task
+→ Open MULTIPLE browser windows:
+  - Window 1: Claude Code → Frontend task
+  - Window 2: Claude Code → Backend task
+  - Monitor both, check progress via screenshots
+  - Merge results when done
+
+### 5. Image / Design Task
+→ Open Gemini (gemini.google.com) or appropriate tool
+→ Type the prompt, wait for generation, download result
+
+### 6. Research + Code Task
+→ Open ChatGPT or Grok for research
+→ Open Claude Code for implementation
+→ Feed research results into the code task
+
+## Multi-Window Management Protocol
+
+When opening multiple AI windows:
+
+1. OPEN: Use shell to launch browser tabs
+   ```
+   # Example: open two Claude Code sessions
+   open "https://claude.ai/code" &
+   sleep 2
+   open "https://claude.ai/code" &
+   ```
+   Or use your browser tool / keyboard shortcuts.
+
+2. ASSIGN: Take screenshot → identify each window → type task into each one
+   - Window 1: Click on it → type frontend task → send
+   - Window 2: Click on it → type backend task → send
+
+3. MONITOR: Periodically screenshot to check progress
+   - If a window is done → read the output
+   - If a window is stuck → intervene (click retry, modify prompt)
+   - If rate limited → note it, switch to another platform
+
+4. COLLECT: When all windows are done:
+   - Screenshot each result
+   - Extract code/text
+   - Merge if needed (git or manual)
+
+5. REPORT: Summarize what was done and send results back
+
+## Platform Knowledge
+
+| Platform | URL | Best For | Limit |
+|----------|-----|----------|-------|
+| Claude Code Web | claude.ai/code | Heavy coding, multi-file | ~100/5hr |
+| Claude Web | claude.ai/new | Single-file code, analysis | ~100/5hr |
+| ChatGPT | chatgpt.com | Research, Q&A, brainstorm | ~80/3hr |
+| Grok | grok.com | Quick Q&A, fast responses | ~30/2hr |
+| Gemini | gemini.google.com | Images, multimodal | varies |
+
+## Important Rules
+
+1. EFFICIENCY: Don't open a browser for simple questions. Answer directly.
+2. PARALLEL: For complex tasks, use multiple windows simultaneously.
+3. MONITOR: Take screenshots to check on running tasks.
+4. ADAPT: If one platform is rate limited, switch to another.
+5. REPORT: Always give a clear summary of what you did and the results.
+6. GIT: For multi-agent code tasks, use git branches to merge work.
+7. PERSIST: If a task is interrupted (rate limit), save progress and tell the user.
+
+## Response Format
+
+Always respond with:
+1. What you're going to do (brief plan)
+2. Execute the plan
+3. Final result / summary
+
+Keep responses concise. The user is on a phone (Telegram).
+""".strip()
+
+
+# ─── Quota Tracking (lightweight, for the system prompt) ────────────────────
+
 _quota = None
-
-def _get_web_ai():
-    global _web_ai
-    if _web_ai is None:
-        from web_ai import WebAIRouter
-        _web_ai = WebAIRouter()
-    return _web_ai
 
 def _get_quota():
     global _quota
     if _quota is None:
-        from quota_tracker import QuotaTracker
-        _quota = QuotaTracker()
+        try:
+            from quota_tracker import QuotaTracker
+            _quota = QuotaTracker()
+        except ImportError:
+            _quota = None
     return _quota
 
 
-# ─── Computer Control Detection ─────────────────────────────────────────────
-# These keywords indicate the task requires actual computer control
-# (mouse, keyboard, file system, apps) — ONLY these go to Claude CLI.
-
-COMPUTER_CONTROL_KEYWORDS_ZH = [
-    "打开", "截图", "截屏", "鼠标", "键盘", "点击", "右键",
-    "文件管理", "打开文件", "运行程序", "桌面", "窗口",
-    "复制文件", "移动文件", "删除文件", "安装软件", "安装程序",
-    "终端", "命令行", "打开浏览器", "打开app", "打开应用",
-    "屏幕", "录屏", "拖拽", "剪贴板", "系统设置",
-    "打开vscode", "打开编辑器", "保存文件",
-]
-
-COMPUTER_CONTROL_KEYWORDS_EN = [
-    "screenshot", "open app", "open file", "open browser", "open vscode",
-    "click", "right click", "mouse", "keyboard", "drag",
-    "clipboard", "terminal", "desktop", "window",
-    "move file", "copy file", "delete file", "rename file",
-    "install", "run command", "execute", "launch",
-    "take a screenshot", "screen recording", "system settings",
-    "file manager", "task manager", "finder",
-]
-
-# Patterns that strongly indicate computer control
-COMPUTER_CONTROL_PATTERNS = [
-    r"帮我打开",
-    r"帮我安装",
-    r"帮我运行",
-    r"帮我截",
-    r"open\s+\w+\s+app",
-    r"run\s+\w+\s+command",
-    r"take\s+a?\s*screenshot",
-    r"在我的?电脑",
-    r"在本地",
-    r"on my (?:computer|desktop|machine)",
-]
+def _get_quota_context() -> str:
+    """Build a quota status string to inject into the prompt."""
+    quota = _get_quota()
+    if not quota:
+        return ""
+    return f"\n\n## Current Platform Quotas\n{quota.status_report()}\n"
 
 
-def needs_computer_control(message: str) -> bool:
-    """
-    Detect if a task requires actual computer control (mouse/keyboard/files/apps).
+# ─── Claude CLI Interface ───────────────────────────────────────────────────
 
-    Only tasks that need physical computer interaction should go to Claude CLI.
-    Everything else (coding, Q&A, analysis) goes to free web AI platforms.
+def _get_claude_cmd() -> str:
+    """Find the claude CLI command."""
+    # Windows
+    for cmd in ["claude.cmd", "claude.exe", "claude"]:
+        try:
+            result = subprocess.run(
+                [cmd, "--version"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return cmd
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return "claude"
 
-    Returns True → route to Claude CLI
-    Returns False → route to web AI (free)
-    """
-    msg_lower = message.lower()
 
-    # Check Chinese keywords
-    for kw in COMPUTER_CONTROL_KEYWORDS_ZH:
-        if kw in msg_lower:
-            return True
+# Session management
+SESSION_FILE = Path(__file__).parent / ".harness_sessions.json"
 
-    # Check English keywords
-    for kw in COMPUTER_CONTROL_KEYWORDS_EN:
-        if kw in msg_lower:
-            return True
 
-    # Check regex patterns
-    import re
-    for pattern in COMPUTER_CONTROL_PATTERNS:
-        if re.search(pattern, msg_lower):
-            return True
+def _load_sessions() -> dict:
+    if SESSION_FILE.exists():
+        try:
+            return json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
 
-    return False
+
+def _save_sessions(sessions: dict):
+    try:
+        SESSION_FILE.write_text(json.dumps(sessions, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to save sessions: {e}")
+
+
+def _get_session_id(chat_id: int) -> str | None:
+    """Get the Claude CLI session ID for a chat, if any."""
+    sessions = _load_sessions()
+    return sessions.get(str(chat_id), {}).get("session_id")
+
+
+def _save_session_id(chat_id: int, session_id: str):
+    """Save the Claude CLI session ID for a chat."""
+    sessions = _load_sessions()
+    sessions[str(chat_id)] = {
+        "session_id": session_id,
+        "updated_at": time.time(),
+    }
+    _save_sessions(sessions)
 
 
 # ─── Main Processing Function ────────────────────────────────────────────────
@@ -128,35 +222,20 @@ async def process_with_harness(
     chat_id: int,
     context,
     send_response=None,
-    cli_fallback=None,
 ) -> bool:
     """
-    PRIMARY message processor. Routes to free web AI or Claude CLI.
+    Process a message through the Harness Agent (Claude CLI with orchestrator prompt).
+
+    This is the PRIMARY processing mode. Claude CLI controls the computer
+    and coordinates multiple AI tools as needed.
 
     Returns True if successful, False to fall back to API mode.
-
-    Flow:
-    1. Check if task needs computer control → Claude CLI
-    2. Classify task difficulty (Level 1-5)
-    3. Pick best available platform(s) — quota-aware
-    4. Execute via browser automation (parallel if multi-platform)
-    5. Send result back to Telegram
-
-    Args:
-        user_message: The user's message text
-        chat_id: Telegram chat ID
-        context: Telegram context object
-        send_response: Optional custom send function
-        cli_fallback: Optional async function to call Claude CLI for computer control tasks
     """
-    quota = _get_quota()
-    web_ai = _get_web_ai()
 
     # Helper to send messages back to Telegram
     async def _send(text: str):
         if not text:
             return
-        # Telegram message limit is 4096 chars
         chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for chunk in chunks:
             if send_response:
@@ -168,108 +247,76 @@ async def process_with_harness(
                     logger.error(f"Failed to send message: {e}")
 
     try:
-        # ── Step 0: Computer control check ──────────────────────────────
-        if needs_computer_control(user_message):
-            await _send("🖥️ 检测到需要操控电脑 → Claude CLI")
+        # Build the full prompt with system instructions + quota context
+        quota_ctx = _get_quota_context()
+        full_prompt = f"{user_message}{quota_ctx}"
 
-            if cli_fallback:
-                success = await cli_fallback(user_message, chat_id, context)
-                if success:
-                    return True
-                await _send("⚠️ CLI 执行失败，尝试浏览器模式...")
-                # Fall through to web AI as backup
-            else:
-                # No CLI fallback available — tell user
-                await _send(
-                    "⚠️ 此任务需要操控电脑（截图/打开文件等），"
-                    "但 Claude CLI 未连接。\n"
-                    "请确保 Bridge Mode 可用，或改用不需要操控电脑的方式描述任务。"
-                )
-                return False
+        # Get or create session for conversation continuity
+        session_id = _get_session_id(chat_id)
+        claude_cmd = _get_claude_cmd()
 
-        # ── Step 1: Classify and route ──────────────────────────────────
-        route = web_ai.classify_and_route(user_message)
-        platform = route["platform"]
-        difficulty = route["difficulty"]
-        is_parallel = route["parallel"]
-        subtasks = route.get("subtasks", [])
+        # Build the CLI command
+        cmd = [claude_cmd, "-p"]
 
-        # ── Step 2: Check quota ─────────────────────────────────────────
-        if not quota.is_available(platform):
-            fallback = quota.get_best_available()
-            if fallback:
-                await _send(f"⚡ {platform} 用量已满，切换到 {fallback}")
-                platform = fallback
-            else:
-                wait = quota.next_available_in()
-                wait_min = max(1, int(wait / 60))
-                await _send(
-                    f"⏳ 所有平台用量已满。最快 {wait_min} 分钟后恢复。\n"
-                    f"发 /quota 查看详情。"
-                )
-                return False  # Fall back to API mode
+        # Resume existing session for long conversations
+        if session_id:
+            cmd.extend(["--resume", session_id])
 
-        # ── Step 3: Notify user ─────────────────────────────────────────
-        if is_parallel and len(subtasks) > 1:
-            platforms_str = ", ".join(s["platform"] for s in subtasks)
-            await _send(
-                f"🌐 Level {difficulty} → 多平台并行分发\n"
-                f"平台: {platforms_str}\n"
-                f"子任务: {len(subtasks)} 个"
-            )
-        else:
-            await _send(f"🌐 Harness → {platform} (Level {difficulty})")
+        # Add system prompt on first message (no session yet)
+        if not session_id:
+            cmd.extend(["--system-prompt", HARNESS_SYSTEM_PROMPT])
 
+        # Add the user's message
+        cmd.append(full_prompt)
+
+        await _send("🤖 Harness Agent 处理中...")
         try:
             await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         except Exception:
             pass
 
-        # ── Step 4: Execute ─────────────────────────────────────────────
-        if is_parallel and len(subtasks) > 1:
-            # Parallel multi-platform execution
-            result = await _execute_parallel(web_ai, quota, subtasks, _send)
-        else:
-            # Single platform execution
-            result = await web_ai.execute(platform, user_message)
-            quota.record(platform, rate_limited=result.get("rate_limited", False))
+        # Execute Claude CLI
+        # Run in a thread to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: _run_claude_cli(cmd, timeout=300),
+        )
 
-        # ── Step 5: Send result ─────────────────────────────────────────
         if result["success"]:
-            response = result["text"]
-            if not response:
-                response = "✅ 任务已执行（无文字输出）。"
-            await _send(response)
+            # Try to capture session ID from output for continuation
+            new_session_id = result.get("session_id")
+            if new_session_id:
+                _save_session_id(chat_id, new_session_id)
+            elif not session_id:
+                # Claude CLI might output session info — try to parse it
+                parsed_id = _parse_session_id(result["output"])
+                if parsed_id:
+                    _save_session_id(chat_id, parsed_id)
 
-            # Send code blocks separately for easy copying
-            for i, code in enumerate(result.get("code_blocks", [])):
-                if code.strip():
-                    await _send(f"```\n{code[:3500]}\n```")
+            # Record quota usage if we can detect which platform was used
+            quota = _get_quota()
+            if quota:
+                quota.record("claude_cli")
 
+            # Send response
+            await _send(result["output"])
             return True
         else:
             error = result.get("error", "Unknown error")
+            logger.error(f"Claude CLI failed: {error}")
 
-            # Rate limit handling with auto-retry on another platform
-            if "rate limit" in error.lower() or result.get("rate_limited"):
-                quota.record(platform, rate_limited=True)
-                await _send(f"⏳ {platform} 达到限制。")
+            if "rate limit" in error.lower() or "token" in error.lower():
+                await _send(
+                    "⏳ Claude CLI 达到用量限制。\n"
+                    "可以等待恢复，或直接在 Telegram 中用 API 模式回复。"
+                )
+                quota = _get_quota()
+                if quota:
+                    quota.record("claude_cli", rate_limited=True)
+            else:
+                await _send(f"⚠️ Harness Agent 错误: {error[:500]}")
 
-                fallback = quota.get_best_available()
-                if fallback and fallback != platform:
-                    await _send(f"🔄 切换到 {fallback} 重试...")
-                    result2 = await web_ai.execute(fallback, user_message)
-                    quota.record(fallback, rate_limited=result2.get("rate_limited", False))
-                    if result2["success"]:
-                        await _send(result2["text"])
-                        for code in result2.get("code_blocks", []):
-                            if code.strip():
-                                await _send(f"```\n{code[:3500]}\n```")
-                        return True
-
-                return False  # Fall back to API
-
-            await _send(f"⚠️ Harness 错误: {error[:300]}")
             return False
 
     except Exception as e:
@@ -278,123 +325,162 @@ async def process_with_harness(
         return False
 
 
-async def _execute_parallel(web_ai, quota, subtasks: list[dict], _send) -> dict:
+def _run_claude_cli(cmd: list[str], timeout: int = 300) -> dict:
     """
-    Execute multiple subtasks on different platforms in parallel.
-    Collects results and merges them.
+    Run Claude CLI and capture output.
+
+    Returns:
+        {"success": bool, "output": str, "error": str, "session_id": str}
     """
-    async def _run_one(subtask: dict) -> dict:
-        platform = subtask["platform"]
-        prompt = subtask["prompt"]
-        try:
-            result = await web_ai.execute(platform, prompt)
-            quota.record(platform, rate_limited=result.get("rate_limited", False))
+    try:
+        env = os.environ.copy()
+        # Ensure Claude CLI can find its config
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
 
-            # If this platform failed, try fallback
-            if not result["success"] and result.get("rate_limited"):
-                quota.record(platform, rate_limited=True)
-                fallback = quota.get_best_available()
-                if fallback:
-                    await _send(f"🔄 {platform} 限流 → {fallback}")
-                    result = await web_ai.execute(fallback, prompt)
-                    quota.record(fallback, rate_limited=result.get("rate_limited", False))
-
-            return {**result, "subtask": subtask.get("label", ""), "platform": platform}
-        except Exception as e:
+        if result.returncode == 0:
+            output = result.stdout.strip()
             return {
-                "success": False, "text": "", "code_blocks": [],
-                "rate_limited": False, "error": str(e),
-                "subtask": subtask.get("label", ""), "platform": platform,
+                "success": True,
+                "output": output or "(no output)",
+                "error": "",
+                "session_id": _parse_session_id(output) or _parse_session_id(result.stderr),
+            }
+        else:
+            return {
+                "success": False,
+                "output": result.stdout.strip(),
+                "error": result.stderr.strip() or f"Exit code {result.returncode}",
+                "session_id": "",
             }
 
-    # Run all subtasks concurrently
-    tasks = [_run_one(st) for st in subtasks]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "output": "",
+            "error": f"Claude CLI timed out after {timeout}s. Task may still be running.",
+            "session_id": "",
+        }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "output": "",
+            "error": "Claude CLI not found. Install: npm install -g @anthropic-ai/claude-code",
+            "session_id": "",
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "output": "",
+            "error": str(e),
+            "session_id": "",
+        }
 
-    # Merge results
-    all_text = []
-    all_code = []
-    any_success = False
 
-    for i, res in enumerate(results):
-        if isinstance(res, Exception):
-            all_text.append(f"[子任务 {i+1} 失败: {str(res)[:100]}]")
-            continue
+def _parse_session_id(text: str) -> str | None:
+    """Try to extract a session ID from Claude CLI output."""
+    if not text:
+        return None
+    import re
+    # Claude CLI outputs session ID in various formats
+    patterns = [
+        r"session[_\s]?id[:\s]+([a-f0-9-]+)",
+        r"--resume\s+([a-f0-9-]+)",
+        r"Session:\s+([a-f0-9-]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
 
-        label = res.get("subtask", f"Part {i+1}")
-        if res["success"]:
-            any_success = True
-            all_text.append(f"━━━ {label} ({res['platform']}) ━━━")
-            all_text.append(res["text"])
-            all_code.extend(res.get("code_blocks", []))
-        else:
-            all_text.append(f"[{label} 失败: {res.get('error', 'unknown')[:100]}]")
 
-    return {
-        "success": any_success,
-        "text": "\n\n".join(all_text),
-        "code_blocks": all_code,
-        "rate_limited": False,
-        "error": "" if any_success else "All subtasks failed",
-        "duration": 0,
-    }
+# ─── Session Management ──────────────────────────────────────────────────────
+
+def clear_session(chat_id: int):
+    """Clear the harness session for a chat (start fresh)."""
+    sessions = _load_sessions()
+    sessions.pop(str(chat_id), None)
+    _save_sessions(sessions)
+
+
+def get_session_info(chat_id: int) -> str:
+    """Get session info for a chat."""
+    sessions = _load_sessions()
+    info = sessions.get(str(chat_id))
+    if not info:
+        return "No active Harness session."
+    updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.get("updated_at", 0)))
+    return (
+        f"Session: {info.get('session_id', 'unknown')}\n"
+        f"Last active: {updated}"
+    )
 
 
 # ─── Status & Commands ───────────────────────────────────────────────────────
 
 def get_quota_status() -> str:
     """Get quota status for /quota command."""
-    return _get_quota().status_report()
+    quota = _get_quota()
+    if quota:
+        return quota.status_report()
+    return "Quota tracker not available."
 
 
 def get_harness_status() -> str:
     """Get harness status for /status command."""
-    quota = _get_quota()
-    available = quota.get_all_available()
-    exhausted = quota.get_all_exhausted()
-
     lines = [
-        "🌐 Harness 状态 (PRIMARY MODE)",
+        "🤖 Harness Agent 状态",
         "─" * 30,
         "",
-        "路由逻辑:",
-        "  消息进来 → 检测是否需要操控电脑",
-        "  ├─ 需要操控 → Claude CLI",
-        "  └─ 不需要 → 免费网页AI (自动选择)",
+        "模式: Claude CLI 控制电脑 (PRIMARY)",
         "",
-        f"可用平台: {', '.join(available) if available else '无'}",
-        f"已满平台: {', '.join(exhausted) if exhausted else '无'}",
+        "能力:",
+        "  ✅ 直接回答问题",
+        "  ✅ 写代码 (自身就是 Claude Code)",
+        "  ✅ 打开多个 AI 窗口并行工作",
+        "  ✅ 用鼠标键盘操控所有 AI 工具",
+        "  ✅ 截图监控各窗口进度",
+        "  ✅ 打开 Gemini 生成图片",
+        "  ✅ Git 合并多 agent 结果",
+        "  ✅ 自适应 — 平台满了自动切换",
+        "",
+        "架构:",
+        "  TG → Claude CLI (有39个工具) → 控制电脑",
+        "       ├─ 简单 → 直接回答",
+        "       ├─ 代码 → 自己写 / 开 Claude Code",
+        "       ├─ 复杂 → 多窗口并行",
+        "       └─ 图片 → 开 Gemini",
     ]
 
-    if exhausted:
-        for p in exhausted:
-            wait = quota.time_until_available(p)
-            if wait > 0:
-                lines.append(f"  {p}: {int(wait/60)}分钟后恢复")
+    # Add Claude CLI status
+    try:
+        claude_cmd = _get_claude_cmd()
+        result = subprocess.run(
+            [claude_cmd, "--version"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            lines.append(f"\nClaude CLI: ✅ {result.stdout.strip()}")
+        else:
+            lines.append("\nClaude CLI: ⚠️ installed but error")
+    except Exception:
+        lines.append("\nClaude CLI: ❌ not found")
 
-    return "\n".join(lines)
-
-
-def test_routing(message: str) -> str:
-    """Test how a message would be routed (for debugging)."""
-    web_ai = _get_web_ai()
+    # Add quota info
     quota = _get_quota()
+    if quota:
+        lines.append("")
+        lines.append(quota.status_report())
 
-    is_cli = needs_computer_control(message)
-    route = web_ai.classify_and_route(message)
+    # Add active sessions
+    sessions = _load_sessions()
+    if sessions:
+        lines.append(f"\n活跃对话: {len(sessions)} 个")
 
-    lines = [
-        f"消息: {message[:80]}",
-        f"需要操控电脑: {'是 → CLI' if is_cli else '否 → 网页AI'}",
-        f"难度级别: Level {route['difficulty']}",
-        f"目标平台: {route['platform']}",
-        f"并行分发: {'是' if route['parallel'] else '否'}",
-    ]
-
-    if route["parallel"]:
-        for st in route.get("subtasks", []):
-            lines.append(f"  子任务: {st['label']} → {st['platform']}")
-
-    lines.append("")
-    lines.append(quota.status_report())
     return "\n".join(lines)

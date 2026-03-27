@@ -1,65 +1,67 @@
-# Harness Integration for claude-tg-bot
+# Harness Agent — 让你的 TG Bot 变成 AI 总管
 
-## Architecture — Harness-First (零成本优先)
+## 这是什么？
+
+**Harness Agent** = Claude CLI (有39个工具) + 编排指令 = **一个有眼睛和手的AI总管**
+
+它通过 Telegram 接收你的指令，然后**控制你的电脑**来完成任务：
+- 简单问题 → 直接回答
+- 写代码 → 自己写（它本身就是 Claude Code）
+- 复杂任务 → 打开多个 AI 窗口，分配任务，监控进度
+- 生成图片 → 打开 Gemini，操控生成
+- 选择方案 → 用鼠标在 Claude Code 里选 plan
 
 ```
 你手机 (Telegram)
   │
-  │ "帮我写一个 React 登录页面"
+  │ "帮我做一个全栈项目"
   │
   ▼
-TG Bot (你电脑上运行)
-  │
-  ▼
-★ Harness Mode (PRIMARY — 自动分发到免费网页AI) ★
-  │
-  ├─ 1. 检测: 需要操控电脑?
-  │     ├─ YES → Claude CLI (唯一有鼠标/键盘/文件工具的)
-  │     └─ NO  → 继续分析...
-  │
-  ├─ 2. 分类任务难度 (Level 1-5, 纯规则, 零成本)
-  │
-  ├─ 3. 路由到最佳平台:
-  │     ├─ Level 1 (Q&A/聊天)     → Grok / GPT     (最快)
-  │     ├─ Level 2 (单文件代码)    → Claude Web      (免费)
-  │     ├─ Level 3 (重度代码)      → Claude Code Web (免费)
-  │     └─ Level 4-5 (多文件/架构) → 多平台并行分发  (免费)
-  │
-  ├─ 4. 浏览器自动化:
-  │     Chrome → 导航到AI网站 → 粘贴prompt → 等回复 → 提取结果
-  │
-  ├─ 5. Adaptive Quota (自适应用量):
-  │     如果一个平台满了 → 自动切到下一个可用平台
-  │     自动记录用量 → 命中限制时自动降低估计值
-  │
-  └─ 6. 最后手段: API Mode (所有平台都满了才用, 花钱)
+TG Bot → Claude CLI (Harness Agent)
+           │  它有: 截图、鼠标、键盘、Shell、文件、浏览器
+           │
+           ├─ 打开 Claude Code 窗口1 → 前端任务
+           ├─ 打开 Claude Code 窗口2 → 后端任务
+           ├─ 打开 Gemini → 生成 logo
+           ├─ 监控进度（截图查看）
+           ├─ 在 Claude Code 里选择 plan → 点 approve
+           └─ 全部完成 → git merge → 回报给你
 
-成本: Harness = 免费 → CLI = Plan (免费) → API = 付费
+成本: Plan 订阅 (免费额度内)
 ```
 
-## Install (5 Steps)
+## 对比
 
-### Step 1: Copy 3 files
+| | 之前 (Playwright 脚本) | 现在 (Harness Agent) |
+|---|---|---|
+| 方式 | 死板的 CSS selector 粘贴文字 | AI 看屏幕，智能决定下一步 |
+| 能力 | 只能文字输入→输出 | 鼠标、键盘、截图、选plan、生成图片 |
+| 适应性 | UI 一改就挂 | AI 自己判断点哪里 |
+| 多窗口 | 脚本并行但不智能 | AI 监控各窗口进度，智能调度 |
+| Session | 每次都新开 | 长对话，记住上下文 |
 
-Copy these files into your `claude-tg-bot/` directory:
+## 安装 (4 步)
+
+### Step 1: 复制文件
+
+把这 3 个文件放到你的 `claude-tg-bot/` 目录：
 
 ```
-harness_mode.py    → your-bot-dir/harness_mode.py
-web_ai.py          → your-bot-dir/web_ai.py
-quota_tracker.py   → your-bot-dir/quota_tracker.py
+harness_mode.py     → claude-tg-bot/harness_mode.py
+web_ai.py           → claude-tg-bot/web_ai.py      (fallback, 可选)
+quota_tracker.py    → claude-tg-bot/quota_tracker.py
 ```
 
-### Step 2: Add to config.py
+### Step 2: config.py 加一行
 
 ```python
-# Harness Mode — PRIMARY processing mode (free, browser automation)
+# Harness Agent — PRIMARY mode
 HARNESS_MODE = os.getenv("HARNESS_MODE", "true").lower() == "true"
 ```
 
-### Step 3: Patch claude_agent.py — Harness-First Routing
+### Step 3: 改 claude_agent.py — Harness 为主
 
-In `claude_agent.py`, find the `process_message` function.
-Replace the processing logic to make Harness PRIMARY:
+找到 `process_message` 函数，改成 Harness 优先：
 
 ```python
 async def process_message(user_message: str, chat_id: int, context):
@@ -71,82 +73,72 @@ async def process_message(user_message: str, chat_id: int, context):
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"📝 收到 (第{queue_size}条追加)，处理完当前任务后会一起看。",
+                text=f"📝 收到 (第{queue_size}条追加)。",
             )
         except Exception:
             pass
         return
 
     async with lock:
-        # ★ PRIMARY: Harness mode (browser automation, $0)
-        # Routes to free web AI. Only sends computer-control tasks to CLI.
+        # ★ PRIMARY: Harness Agent (Claude CLI + 电脑控制 + 编排)
         if getattr(config, "HARNESS_MODE", True):
             try:
                 from harness_mode import process_with_harness
-
-                # Pass CLI as fallback for computer-control tasks
-                async def _cli_fallback(msg, cid, ctx):
-                    return await _process_with_claude_cli(msg, cid, ctx)
-
                 success = await process_with_harness(
                     user_message, chat_id, context,
                     send_response=_send_response,
-                    cli_fallback=_cli_fallback if getattr(config, "BRIDGE_MODE", True) else None,
                 )
                 if success:
                     return
-                logger.warning("Harness mode failed, falling back to API")
+                logger.warning("Harness Agent failed, falling back")
             except ImportError:
-                logger.warning("harness_mode.py not found, trying CLI")
+                logger.warning("harness_mode.py not found")
             except Exception as e:
                 logger.error(f"Harness error: {e}", exc_info=True)
 
-        # FALLBACK 1: Bridge mode (only if Harness unavailable)
+        # FALLBACK 1: Plain Bridge mode (no harness system prompt)
         if getattr(config, "BRIDGE_MODE", True):
             success = await _process_with_claude_cli(user_message, chat_id, context)
             if success:
                 return
-            logger.warning("Claude CLI also failed, falling back to API")
 
-        # FALLBACK 2: API mode (costs money, last resort)
+        # FALLBACK 2: API mode (costs money)
         try:
             from providers import process_with_auto_fallback
-            # ... (existing API fallback code stays the same)
+            # ... existing API fallback code ...
 ```
 
-### Step 4: Add commands to bot.py
+**关键区别**: Harness Agent 和普通 Bridge Mode 都用 Claude CLI，
+但 Harness Agent 多了一个 system prompt 教它如何编排多窗口。
 
-Add these handlers in `bot.py`'s `main()` function:
+### Step 4: 加 bot 命令
+
+在 `bot.py` 的 `main()` 里加：
 
 ```python
 app.add_handler(CommandHandler("harness", harness_command, filters=auth_filter))
 app.add_handler(CommandHandler("quota", quota_command, filters=auth_filter))
-app.add_handler(CommandHandler("route", route_test_command, filters=auth_filter))
+app.add_handler(CommandHandler("hclear", harness_clear_command, filters=auth_filter))
 ```
 
-And add these functions:
+函数：
 
 ```python
 async def harness_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        status = "✅ PRIMARY" if getattr(config, 'HARNESS_MODE', False) else "❌ OFF"
         try:
             from harness_mode import get_harness_status
-            detail = get_harness_status()
+            await update.message.reply_text(get_harness_status())
         except ImportError:
-            detail = "(harness_mode.py 未安装)"
-        await update.message.reply_text(
-            f"🌐 Harness Mode: {status}\n\n{detail}\n\n"
-            "用法: /harness on|off"
-        )
+            await update.message.reply_text("harness_mode.py 未安装")
         return
     action = context.args[0].lower()
     if action == "on":
         config.HARNESS_MODE = True
-        await update.message.reply_text("✅ Harness Mode 开启 (浏览器自动化, PRIMARY)")
+        await update.message.reply_text("✅ Harness Agent ON")
     elif action == "off":
         config.HARNESS_MODE = False
-        await update.message.reply_text("✅ Harness Mode 关闭 (回退到 CLI/API)")
+        await update.message.reply_text("✅ Harness Agent OFF (fallback to Bridge)")
 
 
 async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,111 +146,62 @@ async def quota_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         from harness_mode import get_quota_status
         await update.message.reply_text(get_quota_status())
     except ImportError:
-        await update.message.reply_text("Harness 未安装。")
+        await update.message.reply_text("未安装")
 
 
-async def route_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test routing without executing — shows where a message would go."""
-    if not context.args:
-        await update.message.reply_text("用法: /route <your message>\n测试消息会被路由到哪个平台")
-        return
-    test_msg = " ".join(context.args)
+async def harness_clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Clear harness session (start fresh conversation)."""
     try:
-        from harness_mode import test_routing
-        await update.message.reply_text(test_routing(test_msg))
+        from harness_mode import clear_session
+        clear_session(update.effective_chat.id)
+        await update.message.reply_text("✅ Harness session cleared. 下次消息会开始新对话。")
     except ImportError:
-        await update.message.reply_text("harness_mode.py 未安装")
+        await update.message.reply_text("未安装")
 ```
 
-### Step 5: Set .env
+### .env
 
 ```env
-# Harness Mode (PRIMARY)
 HARNESS_MODE=true
-
-# Chrome profile for persistent login sessions
-# Windows:
-CHROME_USER_DATA=C:\Users\<your-username>\AppData\Local\Google\Chrome\User Data
-# macOS:
-# CHROME_USER_DATA=~/Library/Application Support/Google/Chrome
-# Linux:
-# CHROME_USER_DATA=~/.config/google-chrome
-
-# Bridge Mode (only for computer control tasks)
 BRIDGE_MODE=true
 ```
 
-### Prerequisites
+## 使用
 
-```bash
-pip install playwright
-playwright install chromium
-```
+安装后，你的 bot 自动用 Harness Agent 处理所有消息：
 
-## First-Time Setup
+| 你发的消息 | Harness Agent 做什么 |
+|-----------|---------------------|
+| "什么是 React？" | 直接回答（不开浏览器） |
+| "帮我写一个函数" | 自己写代码返回 |
+| "帮我做一个全栈项目" | 打开多个 Claude Code 窗口，分配前后端 |
+| "帮我截个图" | 用截图工具截图 |
+| "打开 Gemini 生成一个 logo" | 控制浏览器打开 Gemini，操控生成 |
 
-1. **Login to AI platforms**: Open Chrome and log in to:
-   - https://claude.ai (Claude Web + Claude Code)
-   - https://chatgpt.com (ChatGPT)
-   - https://grok.com (Grok)
+## 命令
 
-   You only need to do this ONCE. The harness reuses your Chrome sessions.
+| 命令 | 说明 |
+|------|------|
+| `/harness` | 查看 Harness Agent 状态 |
+| `/harness on/off` | 开关 |
+| `/quota` | 查看各平台用量 |
+| `/hclear` | 清除当前 harness 对话（重新开始） |
 
-2. **Test routing**: Send `/route 帮我写一个函数` to your bot to see where it would route.
+## Session 持久性
 
-3. **Test execution**: Send a simple message to your bot and watch Chrome open automatically.
+Harness Agent 会保持 Claude CLI session：
+- 你发第一条消息 → 开始新 session
+- 后续消息 → 继续同一 session（有上下文记忆）
+- `/hclear` → 清除 session，下次重新开始
 
-## Commands
+这意味着你可以在 TG 上进行**很长的对话**，Claude 会记住之前说了什么。
 
-| Command | Description |
-|---------|-------------|
-| `/harness` | Show harness status & routing logic |
-| `/harness on/off` | Toggle harness mode |
-| `/quota` | Show per-platform usage & remaining quota |
-| `/route <msg>` | Test routing without executing |
+## 原理
 
-## Routing Logic
+1. **harness_mode.py** 调用 `claude -p --system-prompt "..." "你的消息"`
+2. Claude CLI 收到消息 + Harness 编排指令
+3. Claude 自己决定要不要开浏览器、开几个窗口、怎么分配任务
+4. 所有操控都通过 Claude 的 computer use 工具（截图→分析→点击）
+5. 完成后输出结果，harness_mode.py 发回 Telegram
 
-```
-消息进来 → needs_computer_control() 检测
-  │
-  ├─ 需要操控电脑? (截图/打开文件/鼠标键盘...)
-  │   └─ YES → Claude CLI (Bridge Mode)
-  │
-  └─ NO → classify_and_route() 分类
-      │
-      ├─ Level 1 (Q&A)     → Grok / GPT       (免费, 最快)
-      ├─ Level 2 (单文件)   → Claude Web        (免费)
-      ├─ Level 3 (重度代码)  → Claude Code Web   (免费)
-      ├─ Level 4 (多文件)   → 多平台并行         (免费)
-      └─ Level 5 (架构)     → 多平台并行         (免费)
-          │
-          └─ 如果目标平台满了 → Quota Tracker 自动切到下一个可用平台
-              │
-              └─ 所有平台都满了 → API Mode (付费, 最后手段)
-```
-
-## How Parallel Dispatch Works (Level 4-5)
-
-For complex tasks, the harness automatically:
-1. Splits the task into subtasks (by numbered items, "and" separators, or frontend/backend)
-2. Assigns each subtask to a different AI platform
-3. Executes ALL subtasks simultaneously (asyncio.gather)
-4. Merges results and sends back to Telegram
-
-Example:
-```
-User: "帮我写一个 React 前端 以及 Node.js 后端 API"
-
-Harness:
-  → Frontend → Claude Code Web (parallel)
-  → Backend  → Claude Web (parallel)
-  → Results merged → sent to Telegram
-```
-
-## Troubleshooting
-
-- **"未登录"错误**: 在 Chrome 中手动登录该平台，然后重试
-- **CSS selectors 失效**: AI 平台更新了 UI，需要更新 `web_ai.py` 中的 selectors
-- **所有平台都满了**: 等 cooldown 结束，或用 `/quota` 查看何时恢复
-- **浏览器没打开**: 检查 `CHROME_USER_DATA` 路径是否正确
+**web_ai.py** 是简化版 fallback — 只在 Claude CLI 不可用时使用。
