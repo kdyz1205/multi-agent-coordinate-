@@ -106,7 +106,6 @@ def kill_existing_bot():
     log("Killing existing bot processes...")
     if sys.platform == "win32":
         subprocess.run('taskkill /F /FI "WINDOWTITLE eq run.py*" 2>NUL', shell=True, capture_output=True)
-        # Also kill python processes related to bot
         subprocess.run(
             ["powershell", "-Command",
              "Get-Process python* -ErrorAction SilentlyContinue | "
@@ -135,10 +134,11 @@ def start_bot(bot_dir):
 def cli_test(claude_cmd, message, timeout=90):
     """Send a message via Claude CLI and return the response text."""
     try:
+        # Pass message as argument to -p (not stdin — stdin pipes break on Windows .cmd)
         result = subprocess.run(
-            [claude_cmd, "-p", "--output-format", "json",
+            [claude_cmd, "-p", message, "--output-format", "json",
              "--dangerously-skip-permissions", "--model", "claude-sonnet-4-6"],
-            input=message, capture_output=True, text=True,
+            capture_output=True, text=True,
             timeout=timeout, cwd=str(Path.home()),
         )
         raw = result.stdout.strip()
@@ -191,31 +191,26 @@ def run_all_tests(claude_cmd, tg_send=None):
         results.append((name, ok, reason))
         time.sleep(BETWEEN_TESTS_WAIT)
 
-    # Test 1: Basic response
     t("1. Basic Response",
       "回复OK两个字母",
       lambda r: (True, "") if len(r) >= 2 else (False, "Too short"),
       30)
 
-    # Test 2: No API fallback
     t("2. No API Fallback",
       "你好你是谁？一句话回答",
       lambda r: (True, "") if len(r) > 5 else (False, "Too short"),
       60)
 
-    # Test 3: List projects
     t("3. List Projects",
       "列出我电脑上的 Claude Code 项目目录",
       lambda r: (True, "") if any(k in r for k in ["Users", "Desktop", "项目", "claude", "C:"]) else (False, "No project info"),
       90)
 
-    # Test 4: File operation
     t("4. File Create",
-      '在桌面创建文件 harness_selftest.txt 写入 "harness works" 然后告诉我完成了',
+      "在桌面创建文件 harness_selftest.txt 写入 harness works 然后告诉我完成了",
       lambda r: (True, "") if any(k in r.lower() for k in ["完成", "创建", "done", "wrote", "written", "已"]) else (False, "No confirmation"),
       90)
 
-    # Test 5: Screenshot
     t("5. Screenshot",
       "截屏，用中文描述你看到屏幕上有什么",
       lambda r: (True, "") if len(r) > 30 else (False, "Description too short"),
