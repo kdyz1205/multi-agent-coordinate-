@@ -37,10 +37,10 @@ BOT_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 # User home directory (default working directory for commands)
 USER_HOME = os.path.expanduser("~")
 
-# ─── System Prompt → written to CLAUDE.md file ─────────────────────────────
-# On Windows, passing long strings via --append-system-prompt breaks because
-# .cmd files go through cmd.exe which corrupts special characters and has
-# 8191 char limit. Instead, write to CLAUDE.md which Claude CLI reads automatically.
+# ─── System Prompt → saved to file, loaded via --append-system-prompt-file ──
+# On Windows, --append-system-prompt with long strings breaks because .cmd
+# files go through cmd.exe which corrupts special chars. Instead, write to
+# a file and use --append-system-prompt-file which reads from disk.
 
 _SYSTEM_PROMPT = f"""## RULES
 1. NEVER ask questions. JUST DO IT.
@@ -69,14 +69,12 @@ If fails, try alternatives silently.
 - 操控桌面session → screenshot找窗口, 鼠标点击, 键盘输入
 """
 
-# Write CLAUDE.md to a workspace directory so Claude CLI reads it automatically
-_WORKSPACE = Path(BOT_PROJECT_DIR) / ".harness_workspace"
-_WORKSPACE.mkdir(exist_ok=True)
-_CLAUDE_MD = _WORKSPACE / "CLAUDE.md"
+# Write system prompt to file (read by CLI via --append-system-prompt-file)
+_PROMPT_FILE = Path(BOT_PROJECT_DIR) / ".system_prompt.txt"
 try:
-    _CLAUDE_MD.write_text(_SYSTEM_PROMPT, encoding="utf-8")
+    _PROMPT_FILE.write_text(_SYSTEM_PROMPT, encoding="utf-8")
 except Exception:
-    pass  # Non-fatal, will still work without it
+    pass
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -143,7 +141,6 @@ async def _run_claude_cli(
     timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
     session_id = _claude_sessions.get(chat_id)
 
-    # Short prefix — main instructions are in CLAUDE.md (read automatically by CLI)
     user_message = f"[TG bot msg] {user_message}"
 
     args = [
@@ -152,6 +149,7 @@ async def _run_claude_cli(
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--model", config.CLAUDE_MODEL,
+        "--append-system-prompt-file", str(_PROMPT_FILE),
     ]
     if session_id:
         args.extend(["--resume", session_id])
@@ -164,13 +162,11 @@ async def _run_claude_cli(
     proc = None
 
     try:
-        # cwd = workspace with CLAUDE.md so CLI reads system prompt from file
-        # (avoids Windows cmd.exe escaping issues with --append-system-prompt)
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=str(_WORKSPACE),
+            cwd=USER_HOME,
         )
 
         stdout_data, stderr_data = await asyncio.wait_for(

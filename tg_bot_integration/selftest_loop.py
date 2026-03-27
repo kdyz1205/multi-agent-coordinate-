@@ -154,13 +154,12 @@ def deploy(bot_dir):
         except Exception:
             pass
 
-    # Verify CLAUDE.md workspace was created (system prompt lives here now)
-    workspace = bot_dir / ".harness_workspace"
-    claude_md = workspace / "CLAUDE.md"
-    if claude_md.exists():
-        log(f"  CLAUDE.md ready ({claude_md.stat().st_size} bytes)")
+    # Verify system prompt file will be created on bot startup
+    prompt_file = bot_dir / ".system_prompt.txt"
+    if prompt_file.exists():
+        log(f"  System prompt file ready ({prompt_file.stat().st_size} bytes)")
     else:
-        log("  WARNING: CLAUDE.md not found — bot startup will create it")
+        log("  System prompt file will be created on bot startup")
 
     # Clear sessions
     s = bot_dir / ".sessions.json"
