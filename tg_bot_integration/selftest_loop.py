@@ -122,7 +122,7 @@ def deploy(bot_dir):
     return True
 
 
-def kill_existing_bot():
+def kill_existing_bot(bot_dir=None):
     log("Killing ALL python/claude processes (except self)...")
     if sys.platform == "win32":
         my_pid = os.getpid()
@@ -134,6 +134,16 @@ def kill_existing_bot():
             capture_output=True, timeout=10
         )
     time.sleep(5)
+
+    # Clean up PID lock files so bot can start fresh
+    if bot_dir:
+        for pattern in ["*.pid", ".bot.pid", "bot.pid", ".pid_lock"]:
+            for f in Path(str(bot_dir)).glob(pattern):
+                try:
+                    f.unlink()
+                    log(f"  Removed PID file: {f.name}")
+                except Exception:
+                    pass
     log("  Done.")
 
 
@@ -296,7 +306,7 @@ def main():
 
         # Restart bot
         log("\n--- RESTART BOT ---")
-        kill_existing_bot()
+        kill_existing_bot(bot_dir)
         bot_proc = start_bot(bot_dir)
         log(f"Waiting {BOT_STARTUP_WAIT}s for startup...")
         time.sleep(BOT_STARTUP_WAIT)
