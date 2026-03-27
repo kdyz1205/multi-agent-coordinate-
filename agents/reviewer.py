@@ -69,9 +69,10 @@ def create_reviewer_agent(
             1.0,
         )
 
-        # Swap direction
+        # Swap direction — send back to original source
+        original_source = handoff.source_agent
         handoff.source_agent = name
-        handoff.target_agent = handoff.source_agent if handoff.source_agent != name else "coder"
+        handoff.target_agent = original_source if original_source != name else "coder"
 
         return handoff
 

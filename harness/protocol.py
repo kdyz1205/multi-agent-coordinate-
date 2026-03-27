@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import hashlib
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -47,7 +47,9 @@ class FilePayload:
 
     @classmethod
     def from_dict(cls, data: dict) -> FilePayload:
-        return cls(**data)
+        # Only pass known fields to avoid TypeError on extra keys
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 
 @dataclass
@@ -128,13 +130,15 @@ class Handoff:
             self.is_converged = True
         return self.is_converged
 
-    def to_json(self, indent: int = 2) -> str:
+    def to_dict(self) -> dict:
         d = asdict(self)
-        # Convert enums in messages
         for msg in d.get("messages", []):
             if isinstance(msg.get("msg_type"), MessageType):
                 msg["msg_type"] = msg["msg_type"].value
-        return json.dumps(d, indent=indent, ensure_ascii=False)
+        return d
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
 
     def save(self, path: str | Path):
         path = Path(path)

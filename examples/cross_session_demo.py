@@ -10,6 +10,9 @@ Session B: Integrates it into the main website
 Run in Session A first, then Session B.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from harness import Harness, Agent, AgentConfig, Handoff
 from harness.protocol import AgentRole
 from harness.channels import GitChannel

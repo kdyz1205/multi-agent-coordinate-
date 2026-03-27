@@ -5,6 +5,9 @@ Run this to see the dispatcher in action and test browser automation.
 """
 
 import asyncio
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dispatcher import Dispatcher
 from browser_agents import BrowserConfig, get_browser_agent
 

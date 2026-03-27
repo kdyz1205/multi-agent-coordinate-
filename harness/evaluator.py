@@ -89,6 +89,8 @@ class EvaluatorOptimizer:
         history = []
         feedback_text = ""  # No feedback on first iteration
 
+        result = None
+        feedback = None
         for i in range(self.max_iterations):
             logger.info(f"Eval-Opt iteration {i + 1}/{self.max_iterations}")
 

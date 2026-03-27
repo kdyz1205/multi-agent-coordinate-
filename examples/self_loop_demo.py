@@ -5,6 +5,9 @@ Shows how a single agent can iterate on its own output
 until convergence (e.g., refining code quality).
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from harness import Harness
 from harness.agent import Agent, AgentConfig
 from harness.protocol import AgentRole, Handoff, Message, MessageType

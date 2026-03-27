@@ -91,6 +91,7 @@ class OrchestratorWorker:
 
         # Step 2-5: Execute in rounds
         all_results = []
+        round_num = 0
         for round_num in range(self.max_rounds):
             logger.info(f"Round {round_num + 1}/{self.max_rounds}")
             self.state.checkpoint(f"round_{round_num + 1}_start")

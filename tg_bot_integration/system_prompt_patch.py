@@ -1,13 +1,13 @@
-"""
+'''
 system_prompt_patch.py — 直接粘贴到 claude_agent.py 的 _SYSTEM_PROMPT 末尾
 
 这不是一个需要 import 的文件。
-这是一段文本，你复制粘贴到 _SYSTEM_PROMPT 的 """ 之前就行。
+这是一段文本，你复制粘贴到 _SYSTEM_PROMPT 的结尾引号之前就行。
 
 或者让你的 bot 自己修改自己（它有这个能力）：
   在 TG 里说: "把 multi-agent-coordinate 仓库里的 system_prompt_patch.py 的内容
                 追加到你的 _SYSTEM_PROMPT 里"
-"""
+'''
 
 # ─── 以下内容直接追加到 claude_agent.py 的 _SYSTEM_PROMPT 末尾 ─────────────
 

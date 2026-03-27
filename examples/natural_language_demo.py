@@ -4,6 +4,9 @@ Natural Language Harness Demo
 Shows how to create a full harness from a plain English description.
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from harness import Harness
 
 

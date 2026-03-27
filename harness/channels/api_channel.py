@@ -47,7 +47,7 @@ class APIChannel:
 
     def send(self, handoff: Handoff):
         """Send a handoff via the API."""
-        self._request("POST", "/handoffs", json.loads(handoff.to_json()))
+        self._request("POST", "/handoffs", handoff.to_dict())
 
     def receive(self, agent_name: str) -> Handoff | None:
         """Receive the next handoff for this agent."""
