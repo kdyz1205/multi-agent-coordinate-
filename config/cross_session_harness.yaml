@@ -1,0 +1,49 @@
+name: cross-session-harness
+
+# Git-based channel for cross-session collaboration
+channel:
+  type: git
+  config:
+    repo_dir: "."
+    remote: origin
+    branch_prefix: agent
+
+# Pipeline: planner -> coder -> reviewer -> integrator
+loop:
+  mode: pipeline
+  max_iterations: 5
+  convergence_threshold: 0.85
+
+agents:
+  - name: planner
+    role: planner
+    description: "Designs architecture and creates implementation plans"
+    capabilities:
+      - architecture
+      - task_decomposition
+    working_dir: "."
+
+  - name: coder
+    role: coder
+    description: "Implements code based on the plan"
+    capabilities:
+      - python
+      - javascript
+      - react
+    working_dir: ./src
+
+  - name: reviewer
+    role: reviewer
+    description: "Reviews code quality and provides feedback"
+    capabilities:
+      - code_review
+      - security_audit
+    working_dir: ./src
+
+  - name: integrator
+    role: integrator
+    description: "Merges all agent outputs into the final project"
+    capabilities:
+      - code_integration
+      - conflict_resolution
+    working_dir: ./dist

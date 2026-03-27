@@ -1,0 +1,34 @@
+name: default-harness
+
+# Communication channel configuration
+channel:
+  type: file          # file | git | api
+  config:
+    base_dir: .handoffs   # For file channel
+    # repo_dir: "."       # For git channel
+    # remote: origin       # For git channel
+    # base_url: http://localhost:8080  # For API channel
+
+# Loop configuration
+loop:
+  mode: ping_pong     # self | ping_pong | pipeline
+  max_iterations: 10
+  convergence_threshold: 0.9
+
+# Agent definitions
+agents:
+  - name: coder
+    role: coder
+    description: "Generates and iterates on code"
+    capabilities:
+      - python
+      - javascript
+    working_dir: "."
+
+  - name: reviewer
+    role: reviewer
+    description: "Reviews code for quality, bugs, and best practices"
+    capabilities:
+      - code_review
+      - quality_assessment
+    working_dir: "."
