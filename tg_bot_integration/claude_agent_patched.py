@@ -425,44 +425,10 @@ async def process_message(user_message: str, chat_id: int, context):
         return
 
     async with lock:
-        # PRIMARY: Claude CLI with Harness Agent skills
-        if getattr(config, "BRIDGE_MODE", True):
-            success = await _process_with_claude_cli(user_message, chat_id, context)
-            if success:
-                return
-            logger.warning("Claude CLI failed, falling back to API providers")
-
-        # FALLBACK: API provider (costs money, last resort)
-        try:
-            from providers import process_with_auto_fallback
-
-            if chat_id not in conversations:
-                conversations[chat_id] = []
-
-            history = conversations[chat_id]
-            pending = _drain_pending(chat_id)
-            if pending:
-                combined = user_message + "\n" + "\n".join(m["text"] for m in pending)
-            else:
-                combined = user_message
-            history.append({"role": "user", "content": combined})
-
-            while len(history) > config.MAX_CONVERSATION_HISTORY:
-                history.pop(0)
-
-            success = await process_with_auto_fallback(history, chat_id, context)
-
-            if not success:
-                return
-
-            conversations[chat_id] = [
-                m for m in conversations[chat_id]
-                if isinstance(m.get("content"), str)
-            ]
-
-        except Exception as e:
-            logger.error(f"API fallback error: {e}", exc_info=True)
-            await _send_response(chat_id, f"❌ 处理失败: {str(e)[:500]}", context)
+        # ONLY Claude CLI — no API fallback (no money spent)
+        success = await _process_with_claude_cli(user_message, chat_id, context)
+        if not success:
+            await _send_response(chat_id, "⚠️ Claude CLI 失败，请重试。", context)
 
 
 def clear_history(chat_id: int):
