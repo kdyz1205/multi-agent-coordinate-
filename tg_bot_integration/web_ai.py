@@ -3,14 +3,15 @@ web_ai.py — Browser automation for AI web interfaces.
 
 DROP THIS FILE into your claude-tg-bot/ directory.
 
-Uses the bot's existing Playwright setup (browser_agent.py) to:
-1. Open AI web pages (Claude, GPT, Grok)
+Uses Playwright to:
+1. Open AI web pages (Claude, GPT, Grok, Claude Code)
 2. Find the input box
 3. Paste the user's prompt
 4. Wait for the response
 5. Extract the text/code
 
-This is the "hands" of the harness — it types into AI chat boxes for you.
+Supports PARALLEL multi-platform dispatch:
+  Level 4-5 tasks → split into subtasks → send to different AIs simultaneously
 
 IMPORTANT: You must be logged in to these AI platforms in Chrome.
 Set CHROME_USER_DATA in .env to your Chrome profile directory:
@@ -22,6 +23,7 @@ import asyncio
 import logging
 import re
 import time
+import os
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -29,26 +31,32 @@ logger = logging.getLogger(__name__)
 # ─── Task Difficulty Classification ──────────────────────────────────────────
 
 DIFFICULTY_KEYWORDS = {
-    5: ["architecture", "system design", "from scratch", "完整系统", "从零", "microservice"],
-    4: ["frontend and backend", "前端后端", "多个文件", "integrate", "merge", "full stack"],
-    3: ["refactor", "optimize", "complex", "authentication", "写一个完整", "重构", "api endpoint"],
-    2: ["write", "create", "function", "component", "写一个", "做一个", "帮我写", "code", "fix"],
-    1: ["what is", "how to", "explain", "什么是", "怎么", "为什么", "translate", "summarize"],
+    5: ["architecture", "system design", "from scratch", "完整系统", "从零",
+        "microservice", "infrastructure", "重构整个", "full application"],
+    4: ["frontend and backend", "前端后端", "多个文件", "integrate", "merge",
+        "full stack", "多个组件", "cross-session", "coordination", "combine"],
+    3: ["refactor", "optimize", "complex", "authentication", "写一个完整",
+        "重构", "api endpoint", "database", "test suite", "algorithm"],
+    2: ["write", "create", "implement", "function", "component", "class",
+        "写一个", "做一个", "帮我写", "code", "script", "fix", "bug"],
+    1: ["what is", "how to", "explain", "什么是", "怎么", "为什么",
+        "translate", "summarize", "list", "compare", "聊天", "你好"],
 }
 
 # Which platform for which difficulty level
 PLATFORM_FOR_DIFFICULTY = {
-    1: "grok",          # Simple Q&A → Grok (free)
-    2: "claude_web",    # Moderate code → Claude
-    3: "claude_web",    # Heavy code → Claude
-    4: "claude_web",    # Multi-file → Claude (single session for now)
-    5: "claude_web",    # Architecture → Claude
+    1: "grok",              # Simple Q&A → Grok (fastest, free)
+    2: "claude_web",        # Single-file code → Claude
+    3: "claude_code",       # Heavy code → Claude Code Web
+    4: "parallel",          # Multi-file → parallel dispatch
+    5: "parallel",          # Architecture → parallel dispatch
 }
+
+# For parallel dispatch — how to assign subtasks
+PARALLEL_PLATFORM_POOL = ["claude_code", "claude_web", "gpt"]
 
 
 # ─── Platform Selectors ─────────────────────────────────────────────────────
-# CSS selectors for each AI platform's UI elements.
-# UPDATE THESE if the platform's UI changes.
 
 PLATFORM_CONFIG = {
     "claude_web": {
@@ -60,6 +68,18 @@ PLATFORM_CONFIG = {
         "streaming": 'div[data-is-streaming="true"]',
         "code": 'pre code',
         "login_check": 'div.ProseMirror, div[contenteditable="true"]',
+        "input_type": "prosemirror",
+    },
+    "claude_code": {
+        "url": "https://claude.ai/code",
+        "input": 'div.ProseMirror[contenteditable="true"], textarea, div[contenteditable="true"]',
+        "send": 'button[aria-label="Send Message"], button[aria-label*="Send"]',
+        "response": 'div[class*="font-claude-message"], div[class*="message"]',
+        "stop": 'button[aria-label="Stop Response"]',
+        "streaming": 'div[data-is-streaming="true"]',
+        "code": 'pre code',
+        "login_check": 'div.ProseMirror, textarea, div[contenteditable="true"]',
+        "input_type": "prosemirror",
     },
     "gpt": {
         "url": "https://chatgpt.com",
@@ -70,6 +90,7 @@ PLATFORM_CONFIG = {
         "streaming": None,
         "code": 'div.markdown pre code',
         "login_check": 'div#prompt-textarea',
+        "input_type": "contenteditable",
     },
     "grok": {
         "url": "https://grok.com",
@@ -80,6 +101,7 @@ PLATFORM_CONFIG = {
         "streaming": None,
         "code": 'pre code',
         "login_check": 'textarea, div[contenteditable="true"]',
+        "input_type": "textarea",
     },
 }
 
@@ -91,19 +113,114 @@ class WebAIRouter:
         self._browser = None
         self._context = None
 
-    def classify_and_route(self, message: str) -> tuple[str, int]:
-        """Classify difficulty and pick platform. Returns (platform, difficulty)."""
+    def classify_and_route(self, message: str) -> dict:
+        """
+        Classify difficulty and decide routing.
+
+        Returns:
+            {
+                "platform": str,       # Primary platform
+                "difficulty": int,     # 1-5
+                "parallel": bool,      # Whether to use parallel dispatch
+                "subtasks": [          # Only if parallel=True
+                    {"platform": str, "prompt": str, "label": str},
+                    ...
+                ]
+            }
+        """
         msg_lower = message.lower()
 
-        # Check from hardest to easiest
+        # Classify difficulty
+        difficulty = 2  # Default: moderate
         for level in sorted(DIFFICULTY_KEYWORDS.keys(), reverse=True):
             for kw in DIFFICULTY_KEYWORDS[level]:
                 if kw in msg_lower:
-                    platform = PLATFORM_FOR_DIFFICULTY[level]
-                    return platform, level
+                    difficulty = level
+                    break
+            else:
+                continue
+            break
 
-        # Default: moderate → claude_web
-        return "claude_web", 2
+        platform = PLATFORM_FOR_DIFFICULTY[difficulty]
+
+        # Handle parallel dispatch for Level 4-5
+        if platform == "parallel":
+            subtasks = self._split_for_parallel(message, difficulty)
+            return {
+                "platform": subtasks[0]["platform"] if subtasks else "claude_code",
+                "difficulty": difficulty,
+                "parallel": len(subtasks) > 1,
+                "subtasks": subtasks,
+            }
+
+        return {
+            "platform": platform,
+            "difficulty": difficulty,
+            "parallel": False,
+            "subtasks": [],
+        }
+
+    def _split_for_parallel(self, message: str, difficulty: int) -> list[dict]:
+        """
+        Split a complex task into subtasks for parallel execution.
+
+        Strategy:
+        - Look for explicit numbered items
+        - Look for "and" / "以及" / "还有" separators
+        - Fallback: frontend/backend split
+        - Last resort: single task on best platform
+        """
+        subtasks = []
+
+        # Strategy 1: Explicit numbered items
+        lines = message.split("\n")
+        numbered = [l.strip() for l in lines if re.match(r"^\d+[\.\)]\s", l.strip())]
+        if len(numbered) > 1:
+            for i, item in enumerate(numbered):
+                platform = PARALLEL_PLATFORM_POOL[i % len(PARALLEL_PLATFORM_POOL)]
+                subtasks.append({
+                    "platform": platform,
+                    "prompt": item,
+                    "label": f"Part {i+1}",
+                })
+            return subtasks
+
+        # Strategy 2: "and" / "以及" separators
+        parts = re.split(r"\band\b|以及|还有|同时", message)
+        if len(parts) > 1:
+            for i, part in enumerate(parts):
+                part = part.strip()
+                if not part:
+                    continue
+                platform = PARALLEL_PLATFORM_POOL[i % len(PARALLEL_PLATFORM_POOL)]
+                subtasks.append({
+                    "platform": platform,
+                    "prompt": part,
+                    "label": f"Part {i+1}",
+                })
+            return subtasks
+
+        # Strategy 3: Frontend/Backend split
+        msg_lower = message.lower()
+        if any(kw in msg_lower for kw in ["frontend", "backend", "前端", "后端", "full stack", "fullstack"]):
+            subtasks.append({
+                "platform": "claude_code",
+                "prompt": f"Frontend part of the following task. Focus ONLY on frontend (UI, components, styling):\n\n{message}",
+                "label": "Frontend",
+            })
+            subtasks.append({
+                "platform": "claude_web",
+                "prompt": f"Backend part of the following task. Focus ONLY on backend (API, database, logic):\n\n{message}",
+                "label": "Backend",
+            })
+            return subtasks
+
+        # Fallback: single task on best platform
+        return [{
+            "platform": "claude_code",
+            "prompt": message,
+            "label": "Main",
+        }]
 
     async def execute(self, platform: str, prompt: str) -> dict:
         """
@@ -112,8 +229,8 @@ class WebAIRouter:
         Returns:
             {
                 "success": bool,
-                "text": str,          # Full response text
-                "code_blocks": [],    # Extracted code blocks
+                "text": str,
+                "code_blocks": list[str],
                 "rate_limited": bool,
                 "error": str,
                 "duration": float,
@@ -130,8 +247,6 @@ class WebAIRouter:
             from playwright.async_api import async_playwright
 
             async with async_playwright() as pw:
-                # Launch with user profile to reuse login sessions
-                import os
                 user_data = os.environ.get("CHROME_USER_DATA", "")
 
                 if user_data:
@@ -162,7 +277,16 @@ class WebAIRouter:
                     # Find input and type
                     input_el = await page.wait_for_selector(config["input"], timeout=10000)
                     await input_el.click()
-                    await page.keyboard.insert_text(prompt)
+
+                    # Different input handling based on element type
+                    if config.get("input_type") == "prosemirror":
+                        # ProseMirror needs special handling — can't just insert_text
+                        await page.keyboard.insert_text(prompt)
+                    elif config.get("input_type") == "textarea":
+                        await input_el.fill(prompt)
+                    else:
+                        await page.keyboard.insert_text(prompt)
+
                     await asyncio.sleep(0.5)
 
                     # Send
@@ -178,9 +302,14 @@ class WebAIRouter:
 
                     # Check for rate limit in response
                     rate_limited = False
-                    if text and ("rate limit" in text.lower() or "hit your limit" in text.lower()
-                                 or "usage cap" in text.lower()):
-                        rate_limited = True
+                    rate_limit_phrases = [
+                        "rate limit", "hit your limit", "usage cap",
+                        "too many requests", "slow down", "limit reached",
+                        "用量已达", "请稍后再试",
+                    ]
+                    if text:
+                        text_lower = text.lower()
+                        rate_limited = any(phrase in text_lower for phrase in rate_limit_phrases)
 
                     # Extract code blocks
                     code_blocks = []
@@ -218,13 +347,12 @@ class WebAIRouter:
 
     async def _wait_for_response(self, page, config: dict, max_wait: int = 180) -> str:
         """Wait for the AI to finish generating and return the text."""
-        # Method 1: Wait for stop button to disappear
+        # Method 1: Wait for stop button to disappear (streaming done)
         if config.get("stop"):
             try:
                 for _ in range(max_wait // 2):
                     stop_btn = await page.query_selector(config["stop"])
                     if stop_btn is None:
-                        # Double check streaming
                         if config.get("streaming"):
                             streaming = await page.query_selector(config["streaming"])
                             if streaming is None:
