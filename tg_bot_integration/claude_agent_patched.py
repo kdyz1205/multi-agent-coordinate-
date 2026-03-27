@@ -172,7 +172,7 @@ async def _run_claude_cli(
 
     args = [
         CLAUDE_CMD,
-        "-p",
+        "-p", user_message,  # Pass message as argument (stdin pipes break on Windows .cmd)
         "--output-format", "json",
         "--dangerously-skip-permissions",
         "--model", config.CLAUDE_MODEL,
@@ -191,14 +191,13 @@ async def _run_claude_cli(
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
-            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=USER_HOME,
         )
 
         stdout_data, stderr_data = await asyncio.wait_for(
-            proc.communicate(input=user_message.encode("utf-8")),
+            proc.communicate(),
             timeout=timeout,
         )
 
