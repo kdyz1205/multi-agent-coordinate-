@@ -25,6 +25,7 @@ from typing import Any
 
 from dispatcher import Dispatcher, TaskRoute, Difficulty
 from browser_agents import get_browser_agent, BrowserConfig, AgentResult
+from tracker import QuotaTracker, SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -58,26 +59,67 @@ class Orchestrator:
         browser_config: BrowserConfig | None = None,
         dispatcher: Dispatcher | None = None,
         git_remote: str = "origin",
+        quota_tracker: QuotaTracker | None = None,
+        session_store: SessionStore | None = None,
     ):
         self.repo_dir = Path(repo_dir)
         self.browser_config = browser_config or BrowserConfig()
-        self.dispatcher = dispatcher or Dispatcher()
+        self.quota = quota_tracker or QuotaTracker()
+        self.sessions = session_store or SessionStore()
+        self.dispatcher = dispatcher or Dispatcher(quota_tracker=self.quota)
         self.git_remote = git_remote
 
     async def execute(self, task: str, context: str = "") -> PipelineResult:
         """
-        Full pipeline execution.
+        Full pipeline execution with adaptive quota management.
 
-        1. Dispatch (classify difficulty, split if needed)
-        2. Execute on browser agent(s)
-        3. Git merge if multi-agent
-        4. Return result
+        1. Check for resumable sessions first
+        2. Dispatch (classify difficulty, split if needed, quota-aware)
+        3. If all platforms exhausted → queue task, report wait time
+        4. Execute on browser agent(s)
+        5. Record usage + manage sessions
+        6. Git merge if multi-agent
+        7. Return result
         """
         start = time.time()
 
-        # Step 1: Dispatch
+        # Step 0: Check for resumable sessions for this task
+        resumable = self._find_resumable_session(task)
+        if resumable:
+            logger.info(f"Resuming session {resumable.session_id} on {resumable.platform}")
+            result = await self._resume_session(resumable)
+            return PipelineResult(
+                success=result.success,
+                task=task,
+                difficulty="RESUMED",
+                platforms_used=[result.platform],
+                agent_results=[result],
+                total_duration=time.time() - start,
+                summary=f"Resumed session on {resumable.platform}\n" + (result.output[:200] if result.output else ""),
+            )
+
+        # Step 1: Dispatch (quota-aware)
         route = self.dispatcher.dispatch(task, context)
         logger.info(f"Dispatched: {route.difficulty.name} → {route.platform}")
+
+        # Step 1.5: If all platforms exhausted, queue and wait
+        if route.metadata.get("all_exhausted"):
+            wait_min = int(route.metadata["wait_seconds"] / 60)
+            logger.warning(f"All platforms exhausted. Next available in {wait_min}m")
+            # Create a paused session so we can resume later
+            session = self.sessions.create(route.platform, task)
+            session.pause("all_platforms_exhausted")
+            self.sessions.update(session)
+            return PipelineResult(
+                success=False,
+                task=task,
+                difficulty=route.difficulty.name,
+                platforms_used=[],
+                agent_results=[],
+                total_duration=time.time() - start,
+                summary=f"All platforms exhausted. Task queued. Next available in {wait_min}m.\n"
+                        f"Session saved: {session.session_id}",
+            )
 
         # Step 2: Execute
         if route.metadata.get("needs_multi_agent"):
@@ -85,14 +127,22 @@ class Orchestrator:
         else:
             agent_results = [await self._execute_single_agent(route)]
 
-        # Step 3: Git merge (if multi-agent)
+        # Step 3: Record usage for each platform used
+        for result in agent_results:
+            if result.platform:
+                self.quota.record_usage(
+                    result.platform,
+                    was_rate_limited=("rate limit" in result.error.lower() if result.error else False),
+                )
+
+        # Step 4: Git merge (if multi-agent)
         merged = False
         git_branch = ""
         if route.metadata.get("needs_git_merge") and len(agent_results) > 1:
             git_branch = self._git_merge(route, agent_results)
             merged = True
 
-        # Step 4: Build result
+        # Step 5: Build result
         success = any(r.success for r in agent_results)
         summary = self._build_summary(route, agent_results, merged)
 
@@ -108,10 +158,66 @@ class Orchestrator:
             summary=summary,
         )
 
+    def _find_resumable_session(self, task: str) -> "SessionState | None":
+        """Check if there's a resumable session for this task."""
+        from tracker import SessionStore
+        # Check paused sessions — mark as resumable if platform is back
+        for session in self.sessions.get_paused():
+            if self.quota.is_available(session.platform):
+                session.mark_resumable()
+                self.sessions.update(session)
+
+        # Find a resumable session matching this task
+        for session in self.sessions.get_resumable():
+            if session.task == task:
+                return session
+        return None
+
+    async def _resume_session(self, session) -> AgentResult:
+        """Resume a paused browser session."""
+        session.resume()
+        self.sessions.update(session)
+
+        agent = get_browser_agent(session.platform, self.browser_config)
+        prompt = session.continuation_prompt or session.task
+
+        result = await agent.execute(prompt)
+
+        # Update session
+        if result.success:
+            session.complete(result.output, result.code_blocks)
+        else:
+            session.fail(result.error)
+        self.sessions.update(session)
+
+        # Record usage
+        self.quota.record_usage(
+            session.platform,
+            was_rate_limited=("rate limit" in result.error.lower() if result.error else False),
+        )
+
+        return result
+
     async def _execute_single_agent(self, route: TaskRoute) -> AgentResult:
-        """Execute task on a single browser agent."""
+        """Execute task on a single browser agent, with session tracking."""
+        # Create session
+        session = self.sessions.create(route.platform, route.task)
+
         agent = get_browser_agent(route.platform, self.browser_config)
-        return await agent.execute(route.task)
+        result = await agent.execute(route.task)
+
+        # Update session based on result
+        if result.success:
+            session.complete(result.output, result.code_blocks)
+        elif "rate limit" in result.error.lower():
+            session.partial_output = result.output
+            session.pause("rate_limited")
+        else:
+            session.fail(result.error)
+
+        session.messages_sent += 1
+        self.sessions.update(session)
+        return result
 
     async def _execute_multi_agent(self, route: TaskRoute) -> list[AgentResult]:
         """Execute subtasks on multiple browser agents in parallel."""

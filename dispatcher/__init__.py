@@ -82,17 +82,30 @@ PLATFORM_MAP: dict[Difficulty, list[str]] = {
 class Dispatcher:
     """
     Routes tasks to the appropriate AI platform based on difficulty.
+    Integrates with QuotaTracker for adaptive routing.
 
     Usage:
         dispatcher = Dispatcher()
         route = dispatcher.dispatch("帮我写一个 React 登录页面")
         # route.platform = "claude_web"
         # route.difficulty = Difficulty.MODERATE
+
+        # With quota awareness:
+        from tracker import QuotaTracker
+        dispatcher = Dispatcher(quota_tracker=QuotaTracker())
+        route = dispatcher.dispatch("...")
+        # If claude_web is exhausted, auto-falls back to gpt
     """
 
-    def __init__(self, rules: list | None = None, platform_map: dict | None = None):
+    def __init__(
+        self,
+        rules: list | None = None,
+        platform_map: dict | None = None,
+        quota_tracker=None,
+    ):
         self.rules = rules or DIFFICULTY_RULES
         self.platform_map = platform_map or PLATFORM_MAP
+        self.quota = quota_tracker  # Optional: tracker.QuotaTracker instance
 
     def classify_difficulty(self, task: str) -> Difficulty:
         """Classify task difficulty using keyword matching."""
@@ -151,14 +164,48 @@ class Dispatcher:
 
         return [task]
 
+    def _apply_quota_fallback(self, platforms: list[str]) -> list[str]:
+        """
+        If quota tracker is available, replace exhausted platforms with fallbacks.
+        This is where adaptive routing happens.
+        """
+        if self.quota is None:
+            return platforms
+
+        resolved = []
+        for p in platforms:
+            if self.quota.is_available(p):
+                resolved.append(p)
+            else:
+                # Platform exhausted — find a fallback
+                fallback = self.quota.get_best_platform(preferred=None)
+                if fallback:
+                    resolved.append(fallback)
+                else:
+                    # Everything exhausted — still add it, orchestrator will queue
+                    resolved.append(p)
+        return resolved
+
     def dispatch(self, task: str, context: str = "") -> TaskRoute:
         """
         Main dispatch function.
         Analyzes the task → classifies difficulty → routes to platform(s).
+        If quota tracker is set, applies adaptive fallbacks.
         """
         difficulty = self.classify_difficulty(task)
         platforms = self.platform_map.get(difficulty, ["claude_web"])
+
+        # Adaptive: replace exhausted platforms with available ones
+        platforms = self._apply_quota_fallback(platforms)
+
         subtasks = self.split_task(task, difficulty)
+
+        # Calculate wait time if all platforms are exhausted
+        wait_seconds = 0
+        if self.quota and not any(self.quota.is_available(p) for p in platforms):
+            wait_seconds = min(
+                self.quota.time_until_available(p) for p in platforms
+            )
 
         route = TaskRoute(
             platform=platforms[0],
@@ -171,6 +218,8 @@ class Dispatcher:
                 "estimated_files": self.estimate_file_count(task),
                 "needs_multi_agent": difficulty >= Difficulty.MULTI_FILE,
                 "needs_git_merge": difficulty >= Difficulty.MULTI_FILE,
+                "all_exhausted": wait_seconds > 0,
+                "wait_seconds": wait_seconds,
             },
         )
 
@@ -190,4 +239,10 @@ class Dispatcher:
             lines.append("Subtasks:")
             for i, st in enumerate(route.subtasks, 1):
                 lines.append(f"  {i}. {st[:100]}")
+        if route.metadata.get("all_exhausted"):
+            wait_min = int(route.metadata["wait_seconds"] / 60)
+            lines.append(f"WARNING: All platforms exhausted. Next available in {wait_min}m")
+        if self.quota:
+            lines.append("")
+            lines.append(self.quota.status_report())
         return "\n".join(lines)

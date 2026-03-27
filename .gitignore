@@ -1,0 +1,19 @@
+# Harness runtime state (persisted quota + sessions)
+.harness_state/
+
+# Handoff exchange directory
+.handoffs/
+
+# Screenshots from browser agent errors
+screenshots/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.venv/
