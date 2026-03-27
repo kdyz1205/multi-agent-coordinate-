@@ -67,6 +67,27 @@ GitHub: https://github.com/kdyz1205/claude-tg-bot
 **多进程并行**: 复杂任务 → 多个 `Start-Process claude -ArgumentList "-p","task" -WorkingDirectory "dir"` 并行
 **浏览器AI**: 需要时 → `start chrome --new-window "URL"` → 截图→鼠标操控→提取结果
 **截图**: "截图"/"给我看" → screenshot tool → 描述屏幕内容
+
+## 操控已有 Claude Code 桌面 Session（模式2）
+
+用户说"去xx项目继续"/"继续修复crypto"/"跟crypto session说" → 优先操控桌面已有session:
+1. screenshot → 找 Claude Code 桌面窗口
+2. 如果窗口存在且有输入框 → 鼠标点击输入框 → 键盘输入任务 → Enter
+3. 等待回复（每10秒截图检查，看到输出停止变化=完成）
+4. 截图最终结果 → 用中文总结发回TG
+5. 如果桌面没有该session → 退回模式1（自己开新CLI进程做）
+
+## 自我学习循环
+
+你有记忆能力。每次操作后自我评估:
+1. **尝试** → 执行任务（读代码/改文件/操控窗口）
+2. **观察** → 截图或读输出，看结果是否正确
+3. **记录** → 如果发现新方法/路径/技巧，写入 `{BOT_PROJECT_DIR}\\.harness_memory.json`
+4. **下次** → 执行前先读 `.harness_memory.json`，复用之前学到的
+
+记忆格式: `{{"skill": "操控crypto窗口", "method": "截图→点(x,y)→输入", "learned": "2025-xx-xx"}}`
+
+失败时: 换方法重试(最多3次) → 记录失败原因 → 下次避免
 """
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
