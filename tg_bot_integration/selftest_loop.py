@@ -85,6 +85,26 @@ def deploy(bot_dir):
             log(f"  PowerShell also failed: {e2}")
             return False
 
+    # Verify file was actually replaced — check for API fallback
+    content = target.read_text(encoding="utf-8")
+    if "process_with_auto_fallback" in content:
+        log("  ERROR: File STILL has API fallback! Stripping manually...")
+        lines = content.split("\n")
+        new_lines = []
+        skip = False
+        for line in lines:
+            if "FALLBACK: API provider" in line or "process_with_auto_fallback" in line:
+                skip = True
+            if skip and line.strip().startswith(("def ", "async def ")) and "process_message" not in line:
+                skip = False
+            if not skip:
+                new_lines.append(line)
+        target.write_text("\n".join(new_lines), encoding="utf-8")
+        log("  Stripped API fallback manually.")
+
+    if "DROP-IN REPLACEMENT" not in target.read_text(encoding="utf-8"):
+        log("  WARNING: File may not be the patched version!")
+
     # Verify syntax
     r = subprocess.run([sys.executable, "-c",
         f"import py_compile; py_compile.compile(r'{target}', doraise=True); print('OK')"],
@@ -92,7 +112,7 @@ def deploy(bot_dir):
     if r.returncode != 0:
         log(f"  SYNTAX ERROR: {r.stderr[:300]}")
         return False
-    log("  Syntax OK, deployed.")
+    log("  Syntax OK, no API fallback, deployed.")
 
     # Clear sessions
     s = bot_dir / ".sessions.json"
@@ -103,17 +123,18 @@ def deploy(bot_dir):
 
 
 def kill_existing_bot():
-    log("Killing existing bot processes...")
+    log("Killing ALL python/claude processes (except self)...")
     if sys.platform == "win32":
-        subprocess.run('taskkill /F /FI "WINDOWTITLE eq run.py*" 2>NUL', shell=True, capture_output=True)
+        my_pid = os.getpid()
         subprocess.run(
             ["powershell", "-Command",
-             "Get-Process python* -ErrorAction SilentlyContinue | "
-             "Where-Object {$_.MainWindowTitle -like '*run.py*' -or $_.MainWindowTitle -like '*bot*'} | "
-             "Stop-Process -Force -ErrorAction SilentlyContinue"],
+             f"Get-Process python*,claude* -ErrorAction SilentlyContinue | "
+             f"Where-Object {{$_.Id -ne {my_pid}}} | "
+             f"Stop-Process -Force -ErrorAction SilentlyContinue"],
             capture_output=True, timeout=10
         )
-    time.sleep(3)
+    time.sleep(5)
+    log("  Done.")
 
 
 def start_bot(bot_dir):
