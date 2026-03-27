@@ -141,15 +141,18 @@ def deploy(bot_dir):
         except Exception:
             pass
 
-    # Disable providers.py so even stale bytecode can't call paid APIs
-    providers_file = bot_dir / "providers.py"
+    # NOTE: Do NOT rename/delete providers.py — bot.py imports PROVIDER_DISPLAY from it.
+    # The patched claude_agent.py simply doesn't call any provider functions.
+
+    # Restore providers.py if it was previously disabled (fix earlier mistake)
     providers_bak = bot_dir / "providers.py.disabled"
-    if providers_file.exists():
+    providers_file = bot_dir / "providers.py"
+    if providers_bak.exists() and not providers_file.exists():
         try:
-            providers_file.rename(providers_bak)
-            log("  Disabled providers.py (renamed to .disabled)")
-        except Exception as e:
-            log(f"  WARNING: Could not disable providers.py: {e}")
+            providers_bak.rename(providers_file)
+            log("  Restored providers.py (bot.py needs it for import)")
+        except Exception:
+            pass
 
     # Verify CLAUDE.md workspace was created (system prompt lives here now)
     workspace = bot_dir / ".harness_workspace"
