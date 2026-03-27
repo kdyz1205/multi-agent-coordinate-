@@ -17,3 +17,4 @@ build/
 # Environment
 .env
 .venv/
+.test_memory.json
