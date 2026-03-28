@@ -392,7 +392,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
                     _save_sessions()
                 await _send_response(chat_id, followup_resp, context)
             except asyncio.TimeoutError:
-                await _send_response(chat_id, "⏰ 追加任务超时(5分钟)。发新消息继续。", context)
+                await _send_response(chat_id, "⏰ 追加任务超时(30分钟)。发新消息继续。", context)
                 break
             except Exception as e:
                 logger.error(f"Follow-up error: {e}", exc_info=True)
@@ -406,7 +406,7 @@ async def _process_with_claude_cli(user_message: str, chat_id: int, context) -> 
     except asyncio.TimeoutError:
         await _send_response(
             chat_id,
-            "⏰ 任务处理超时(5分钟)。可能仍在后台运行。发新消息继续。",
+            "⏰ 任务处理超时(30分钟)。可能仍在后台运行。发新消息继续。",
             context,
         )
         return True  # Don't fallback to API on timeout
