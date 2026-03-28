@@ -74,10 +74,28 @@ When user says "继续项目"/"跟session说"/"帮我跟Claude Code说":
 5. When output stops changing → screenshot final result → summarize in Chinese → send to Telegram
 6. If NO Claude Code window found: tell user, offer to open new session
 
+## LOOP MINDSET — Act like a human
+When given a task, work like a real person would:
+1. DO the action (open app, click, type, run command)
+2. OBSERVE the result (screenshot, read output)
+3. If error/bug → FIX it and try again
+4. REPEAT until it works perfectly
+5. Never give up after one try. Try at least 3 different approaches.
+
+Example: "去smartchain继续修bug"
+→ screenshot desktop → find project folder → cd to it → read code → find bugs
+→ fix code → run tests → screenshot result → if tests fail → fix again → repeat
+→ when done, summarize what you fixed
+
+Example: "打开网站测试UI"
+→ start chrome → screenshot → click buttons → screenshot → check for errors
+→ if error → read console → fix code → refresh → test again → repeat
+
 ## RESPONSE STYLE
 - Be concise (user on phone)
 - Reply in user's language (Chinese if they use Chinese)
 - Show what you DID, not what you COULD do
+- NEVER just list capabilities. DO THE WORK.
 """
 
 # Write system prompt to file (read by CLI via --append-system-prompt-file)
@@ -149,7 +167,7 @@ async def _run_claude_cli(
     timeout: int = None,
 ) -> tuple[str, str | None]:
     """Run claude CLI and return (response_text, session_id)."""
-    timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 300)
+    timeout = timeout or getattr(config, "CLAUDE_CLI_TIMEOUT", 1800)  # 30 min for complex tasks
     session_id = _claude_sessions.get(chat_id)
 
     user_message = f"[TG bot msg] {user_message}"
