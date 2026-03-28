@@ -2,11 +2,7 @@
 claude_agent.py — Harness Agent: Claude CLI + 多窗口编排 + 项目管理
 
 DROP-IN REPLACEMENT — 直接替换你的 claude-tg-bot/claude_agent.py
-
-改了什么:
-1. _SYSTEM_PROMPT 增加了 Harness 技能（多窗口、项目管理、截图、session管理、多AI协作、权限确认）
-2. 删除了 API fallback（不花钱，只走 CLI）
-3. 没有其他任何改动。路由、session、队列全部保持原样。
+AUTO-UPDATES from GitHub on every bot startup.
 
 Architecture:
   User (Telegram) → bot.py → claude_agent.py → claude -p --resume <session>
@@ -16,16 +12,88 @@ Architecture:
                                               Persistent conversations
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import shutil
 import signal
+import sys
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from pathlib import Path
 import config
 
 logger = logging.getLogger(__name__)
+
+# ─── AUTO-UPDATE ON STARTUP ─────────────────────────────────────────────────
+# Every time this module loads (= bot starts), check GitHub for newer version.
+# If found, replace self, clear __pycache__, and restart the bot process.
+
+_GITHUB_RAW_URL = (
+    "https://raw.githubusercontent.com/kdyz1205/multi-agent-coordinate-"
+    "/main/tg_bot_integration/claude_agent_patched.py"
+)
+_THIS_FILE = Path(__file__).resolve()
+_UPDATE_LOCK = _THIS_FILE.parent / ".update_lock"
+
+
+def _self_update():
+    """Check GitHub for a newer version and hot-replace if found."""
+    try:
+        # Skip if we updated less than 60s ago (prevent restart loops)
+        if _UPDATE_LOCK.exists():
+            lock_age = time.time() - _UPDATE_LOCK.stat().st_mtime
+            if lock_age < 60:
+                logger.debug(f"Skipping update check (last update {lock_age:.0f}s ago)")
+                return False
+
+        # Download latest from GitHub (cache-bust)
+        url = f"{_GITHUB_RAW_URL}?t={int(time.time())}"
+        req = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            remote_content = resp.read()
+
+        # Compare with current file
+        local_content = _THIS_FILE.read_bytes()
+        if hashlib.sha256(remote_content).digest() == hashlib.sha256(local_content).digest():
+            logger.info("Auto-update: already up to date.")
+            return False
+
+        # Different! Replace self
+        logger.warning("Auto-update: NEW VERSION found on GitHub, updating...")
+
+        # Write new version
+        _THIS_FILE.write_bytes(remote_content)
+
+        # Clear __pycache__ so Python loads the new .py, not stale .pyc
+        pycache = _THIS_FILE.parent / "__pycache__"
+        if pycache.exists():
+            shutil.rmtree(pycache, ignore_errors=True)
+
+        # Write lock to prevent restart loops
+        _UPDATE_LOCK.write_text(str(time.time()), encoding="utf-8")
+
+        logger.warning(f"Auto-update: replaced {_THIS_FILE.name} ({len(remote_content)} bytes)")
+        logger.warning("Auto-update: restarting bot process...")
+
+        # Restart the entire bot process (exec replaces current process)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+        # ↑ This line never returns — process is replaced
+
+    except (urllib.error.URLError, OSError) as e:
+        # Network error / offline — skip silently, use current version
+        logger.debug(f"Auto-update: network unavailable ({e})")
+        return False
+    except Exception as e:
+        logger.warning(f"Auto-update: failed ({e}), continuing with current version")
+        return False
+
+
+# Run auto-update on module load (= bot startup)
+_self_update()
 
 # ─── CRITICAL: Strip ANTHROPIC_API_KEY from environment ─────────────────────
 # config.py calls load_dotenv() which injects ANTHROPIC_API_KEY into os.environ.
