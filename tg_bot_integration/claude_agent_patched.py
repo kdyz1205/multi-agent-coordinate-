@@ -216,8 +216,19 @@ async def _run_claude_cli(
                 else:
                     response = "✅ 任务已执行（无文字输出）。"
 
+            # Auth detection — CLI not logged in
+            if response and "not logged in" in response.lower():
+                logger.error(f"Claude CLI not logged in!")
+                response = (
+                    "❌ Claude CLI 未登录！\n\n"
+                    "请在电脑上打开 PowerShell 运行：\n"
+                    "  claude /login\n\n"
+                    "选择 1 (Claude subscription)，完成浏览器登录后重启 bot。"
+                )
+                new_session_id = None
+
             # Rate limit detection — don't store poisoned session
-            if response and ("hit your limit" in response.lower() or "rate limit" in response.lower()):
+            elif response and ("hit your limit" in response.lower() or "rate limit" in response.lower()):
                 logger.warning(f"Claude CLI rate limited: {response[:200]}")
                 response = "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
                 new_session_id = None
