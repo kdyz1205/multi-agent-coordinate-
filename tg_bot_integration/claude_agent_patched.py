@@ -19,12 +19,25 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import time
 from datetime import datetime
 from pathlib import Path
 import config
 
 logger = logging.getLogger(__name__)
+
+# ─── CRITICAL: Strip ANTHROPIC_API_KEY from environment ─────────────────────
+# config.py calls load_dotenv() which injects ANTHROPIC_API_KEY into os.environ.
+# Claude CLI prioritizes API key over OAuth subscription.
+# If the key has no credits → "Credit balance is too low" error.
+# We MUST remove it so CLI falls back to OAuth (Max subscription = free).
+_stripped_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+if _stripped_key:
+    logger.warning(
+        "Stripped ANTHROPIC_API_KEY from environment! "
+        "CLI will use OAuth subscription instead (no API costs)."
+    )
 
 # Full path to claude CLI (npm global install)
 CLAUDE_CMD = os.path.join(
@@ -102,8 +115,18 @@ Example: "打开网站测试UI"
 _PROMPT_FILE = Path(BOT_PROJECT_DIR) / ".system_prompt.txt"
 try:
     _PROMPT_FILE.write_text(_SYSTEM_PROMPT, encoding="utf-8")
-except Exception:
-    pass
+    logger.info(f"System prompt written to {_PROMPT_FILE} ({_PROMPT_FILE.stat().st_size} bytes)")
+except Exception as e:
+    # If this fails, CLI will error with "file not found" — log loudly
+    logger.error(f"CRITICAL: Failed to write system prompt file: {e}")
+    # Try fallback location in temp dir
+    import tempfile
+    _PROMPT_FILE = Path(tempfile.gettempdir()) / "claude_bot_system_prompt.txt"
+    try:
+        _PROMPT_FILE.write_text(_SYSTEM_PROMPT, encoding="utf-8")
+        logger.info(f"System prompt written to fallback: {_PROMPT_FILE}")
+    except Exception as e2:
+        logger.error(f"CRITICAL: Fallback also failed: {e2}")
 
 # ─── Session Persistence ─────────────────────────────────────────────────────
 
@@ -139,9 +162,9 @@ _MAX_PENDING_AGE = 600  # 10 minutes
 
 
 def _get_lock(chat_id: int) -> asyncio.Lock:
-    if chat_id not in _processing_locks:
-        _processing_locks[chat_id] = asyncio.Lock()
-    return _processing_locks[chat_id]
+    # Use setdefault for atomicity — prevents race where two coroutines
+    # both see the key missing and create separate Lock objects
+    return _processing_locks.setdefault(chat_id, asyncio.Lock())
 
 
 # ─── Typing Indicator ────────────────────────────────────────────────────────
@@ -158,6 +181,89 @@ async def _keep_typing(chat_id, context, stop_event):
             break
         except asyncio.TimeoutError:
             pass
+
+
+# ─── Process Cleanup (Windows-safe) ──────────────────────────────────────────
+
+async def _kill_process_tree(proc):
+    """Kill a process and all its children. On Windows, proc.kill() only kills
+    the .cmd wrapper — the actual node process keeps running as an orphan.
+    Use taskkill /T /F to kill the entire process tree."""
+    try:
+        if os.name == "nt":
+            # taskkill /T = kill tree, /F = force
+            await asyncio.create_subprocess_exec(
+                "taskkill", "/T", "/F", "/PID", str(proc.pid),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+        await proc.wait()
+    except Exception as e:
+        logger.debug(f"Process cleanup error (non-fatal): {e}")
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+
+
+# ─── Known Error Patterns ────────────────────────────────────────────────────
+
+_ERROR_PATTERNS = {
+    "auth": [
+        "not logged in",
+        "please run /login",
+    ],
+    "credit": [
+        "credit balance is too low",
+        "credit balance",
+        "insufficient credits",
+        "billing",
+    ],
+    "rate_limit": [
+        "hit your limit",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+    ],
+}
+
+
+def _detect_error(text: str) -> tuple[str | None, str | None]:
+    """Check text for known error patterns. Returns (error_type, user_message) or (None, None)."""
+    if not text:
+        return None, None
+    lower = text.lower()
+
+    for pattern in _ERROR_PATTERNS["auth"]:
+        if pattern in lower:
+            return "auth", (
+                "❌ Claude CLI 未登录！\n\n"
+                "请在电脑上打开 PowerShell 运行：\n"
+                "  claude /login\n\n"
+                "选择 1 (Claude subscription)，完成浏览器登录后重启 bot。"
+            )
+
+    for pattern in _ERROR_PATTERNS["credit"]:
+        if pattern in lower:
+            return "credit", (
+                "❌ API Key 余额不足！\n\n"
+                "Bot 应该用 OAuth 订阅，不是 API Key。\n"
+                "请检查 .env 文件，注释掉 ANTHROPIC_API_KEY：\n"
+                "  # ANTHROPIC_API_KEY=sk-ant-...\n\n"
+                "然后重启 bot。"
+            )
+
+    for pattern in _ERROR_PATTERNS["rate_limit"]:
+        if pattern in lower:
+            return "rate_limit", "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
+
+    return None, None
 
 
 # ─── Claude CLI Runner ────────────────────────────────────────────────────────
@@ -191,11 +297,15 @@ async def _run_claude_cli(
     proc = None
 
     try:
+        # Build clean environment — strip ANTHROPIC_API_KEY to force OAuth
+        clean_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=USER_HOME,
+            env=clean_env,
         )
 
         stdout_data, stderr_data = await asyncio.wait_for(
@@ -206,11 +316,7 @@ async def _run_claude_cli(
     except asyncio.TimeoutError:
         logger.warning(f"Claude CLI timed out after {timeout}s")
         if proc is not None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
+            await _kill_process_tree(proc)
         raise
 
     except FileNotFoundError:
@@ -230,12 +336,42 @@ async def _run_claude_cli(
 
     # Parse JSON response
     raw = stdout_data.decode("utf-8", errors="replace").strip()
+    err_text = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
     new_session_id = None
     response = None
 
+    if err_text:
+        logger.debug(f"Claude CLI stderr (chat {chat_id}): {err_text[:500]}")
+
+    # ── Check stderr for known errors FIRST (often more reliable than stdout) ──
+    err_type, err_msg = _detect_error(err_text)
+    if err_type:
+        logger.error(f"Claude CLI {err_type} error detected in stderr")
+        return err_msg, None
+
+    # ── Parse stdout JSON ──
     if raw:
+        # Claude CLI may output warnings/progress before the JSON.
+        # Find the LAST complete JSON object (not the first — first may be in a warning).
+        data = None
         try:
             data = json.loads(raw)
+        except json.JSONDecodeError:
+            # Find last '{' that starts a valid JSON object
+            last_good_start = -1
+            for i in range(len(raw) - 1, -1, -1):
+                if raw[i] == '{':
+                    try:
+                        data = json.loads(raw[i:])
+                        last_good_start = i
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            if last_good_start == -1:
+                # No valid JSON found — use raw text
+                response = raw
+
+        if data is not None:
             response = data.get("result", "").strip()
             new_session_id = data.get("session_id")
 
@@ -245,48 +381,19 @@ async def _run_claude_cli(
                 else:
                     response = "✅ 任务已执行（无文字输出）。"
 
-            # Auth detection — CLI not logged in
-            if response and "not logged in" in response.lower():
-                logger.error(f"Claude CLI not logged in!")
-                response = (
-                    "❌ Claude CLI 未登录！\n\n"
-                    "请在电脑上打开 PowerShell 运行：\n"
-                    "  claude /login\n\n"
-                    "选择 1 (Claude subscription)，完成浏览器登录后重启 bot。"
-                )
-                new_session_id = None
+    # ── Check stdout response for known errors ──
+    if response:
+        err_type, err_msg = _detect_error(response)
+        if err_type:
+            logger.error(f"Claude CLI {err_type} error detected in response")
+            return err_msg, None  # Don't save session on error
 
-            # Rate limit detection — don't store poisoned session
-            elif response and ("hit your limit" in response.lower() or "rate limit" in response.lower()):
-                logger.warning(f"Claude CLI rate limited: {response[:200]}")
-                response = "⏳ Claude 达到速率限制。请稍等几分钟后再试。"
-                new_session_id = None
-
-        except json.JSONDecodeError:
-            json_start = raw.find('{')
-            if json_start > 0:
-                try:
-                    data = json.loads(raw[json_start:])
-                    response = data.get("result", "").strip()
-                    new_session_id = data.get("session_id")
-                    if not response:
-                        response = raw[:json_start].strip() or "✅ 任务已执行。"
-                except json.JSONDecodeError:
-                    response = raw
-            else:
-                response = raw
-
-    if stderr_data:
-        err_text = stderr_data.decode("utf-8", errors="replace").strip()
-        if err_text:
-            logger.debug(f"Claude CLI stderr (chat {chat_id}): {err_text[:500]}")
-
+    # ── Fallback if no stdout ──
     if not response:
-        err = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else ""
-        if err:
-            logger.error(f"Claude CLI stderr: {err[:500]}")
-            if "error" in err.lower():
-                response = f"⚠️ {err[:500]}"
+        if err_text:
+            logger.error(f"Claude CLI stderr: {err_text[:500]}")
+            if "error" in err_text.lower():
+                response = f"⚠️ {err_text[:500]}"
             else:
                 response = "✅ 任务已执行。"
         else:
